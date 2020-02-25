@@ -1,0 +1,11 @@
+[package]
+name = "jdb"
+version = "0.1.0"
+authors = ["John Erickson <john.t.erickson@gmail.com>"]
+edition = "2018"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+static_assertions = "*"
+array-macro = "1.0.4"
