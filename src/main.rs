@@ -274,9 +274,12 @@ impl<R: BufRead, W: Write> Repl<R,W> {
         loop
         {
             write!(&mut self.output, "db > ").unwrap();
+            self.output.flush().unwrap();
             let mut line = String::new();
             match self.input.read_line(&mut line) {
                 Ok(chars) => {
+                    writeln!(&mut self.output).unwrap();
+
                     if chars == 0 {
                         return 0;
                     }
@@ -316,21 +319,46 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn run(input: &[&str]) -> Vec<String> {
+        let mut input_bytes = Vec::new();
+        for line in input {
+            input_bytes.extend_from_slice(line.as_bytes());
+            input_bytes.push('\n' as u8);
+        }
+        let mut output = Vec::new();
+        let mut repl = Repl::new(&input_bytes[..], &mut output);
+        repl.run();
+        let output = String::from_utf8(output).unwrap();
+        output.lines().map(|line| line.to_owned()).collect()
+    }
+
     #[test]
     fn empty() {
-        let input = b"select\n.exit\n";
-        let mut output = Vec::new();
-        let mut repl = Repl::new(&input[..], &mut output);
-        assert_eq!(0, repl.run());
-        assert_eq!("db > 0 rows:\ndb > ", String::from_utf8(output).unwrap());
+        assert_eq!(
+            run(&["select",".exit"]),
+            [
+                "db > ",
+                "0 rows:",
+                "db > "
+            ]
+        );
     }
 
     #[test]
     fn echo() {
-        let input = b"insert 11 john john@john.com\nselect\n.exit\n";
-        let mut output = Vec::new();
-        let mut repl = Repl::new(&input[..], &mut output);
-        assert_eq!(0, repl.run());
-        assert_eq!("db > db > 1 rows:\n [11 'john' 'john@john.com']\ndb > ", String::from_utf8(output).unwrap());
+        assert_eq!(
+            run(&[
+                "insert 11 john john@john.com",
+                "select",
+                ".exit"
+            ]),
+            [
+                "db > ",
+                "db > ",
+                "1 rows:",
+                " [11 'john' 'john@john.com']",
+                "db > "
+            ]
+        );
     }
 }
