@@ -432,15 +432,16 @@ impl Table {
 
                 let mut cursor = Cursor::table_end(self);
                 cursor.insert(Cell { key: *id, row });
-
-                self.pager.flush_all(); // temp
             }
             Statement::Select => {
+                let mut row_count = 0;
                 let mut cursor = Cursor::table_start(self);
                 while !cursor.end_of_table {
                     writeln!(output, " {}", cursor.cell().as_ref().unwrap().row).unwrap();
                     cursor.advance();
+                    row_count += 1;
                 }
+                writeln!(output, "{} rows.", row_count).unwrap();
             }
         }
     }
@@ -532,13 +533,7 @@ mod tests {
 
     #[test]
     fn empty() {
-        assert_eq!(
-            run(&["select", ".exit"]),
-            [
-                "db > ", // "0 rows:",
-                "db > "
-            ]
-        );
+        assert_eq!(run(&["select", ".exit"]), ["db > ", "0 rows.", "db > "]);
     }
 
     #[test]
@@ -548,8 +543,8 @@ mod tests {
             [
                 "db > ",
                 "db > ",
-                // "1 rows:",
                 " [11 'john' 'john@john.com']",
+                "1 rows.",
                 "db > "
             ]
         );
@@ -566,19 +561,14 @@ mod tests {
             [
                 "db > ",
                 "db > ",
-                // "1 rows:",
                 " [11 'john' 'john@john.com']",
+                "1 rows.",
                 "db > "
             ]
         );
         assert_eq!(
             run_from_file(tempdb.reopen().unwrap(), &["select", ".exit"]),
-            [
-                "db > ",
-                // "1 rows:",
-                " [11 'john' 'john@john.com']",
-                "db > "
-            ]
+            ["db > ", " [11 'john' 'john@john.com']", "1 rows.", "db > "]
         );
     }
 }
