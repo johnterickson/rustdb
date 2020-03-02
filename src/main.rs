@@ -130,6 +130,16 @@ impl LeafNode {
         }
     }
 
+    fn find(&mut self, key: Id) -> CellNumber {
+        let cells = &self.cells[0..self.cell_count as usize];
+        let search_result = cells.binary_search_by(|probe| probe.as_ref().unwrap().key.cmp(&key));
+        let cell_number = match search_result {
+            Ok(found) => found,
+            Err(insert_here) => insert_here,
+        };
+        cell_number as CellNumber
+    }
+
     fn serialize<W: Write>(&self, mut writer: W) {
         let mut cell_count = [0u8; size_of::<u32>()];
         cell_count[0..4].copy_from_slice(&self.cell_count.to_le_bytes());
@@ -309,7 +319,7 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
-    fn table_start(table: &'a mut Table) -> Cursor<'a> {
+    fn start(table: &'a mut Table) -> Cursor<'a> {
         let root_page = table.root_page;
         let mut cursor = Cursor {
             table,
@@ -323,22 +333,26 @@ impl<'a> Cursor<'a> {
         cursor
     }
 
-    fn table_end(table: &'a mut Table) -> Cursor<'a> {
+    /*
+    Return the position of the given key.
+    If the key is not present, return the position
+    where it should be inserted
+    */
+    fn find(table: &'a mut Table, key: Id) -> Cursor<'a> {
         let root_page = table.root_page;
+        
+        let cell_number = match table.pager.get_page(root_page).node {
+            Node::Internal(_) => unimplemented!(),
+            Node::Leaf(ref mut leaf) => leaf.find(key)
+        };
+
         let mut cursor = Cursor {
             table,
             page_index: root_page,
-            cell_number: 0,
-            end_of_table: true,
+            cell_number: cell_number,
+            end_of_table: false,
         };
-
-        cursor.cell_number = match cursor.page().node {
-            Node::Internal(_) => unimplemented!(),
-            Node::Leaf(ref leaf) => leaf.cell_count,
-        };
-
-        assert!(cursor.cell().is_none());
-
+        cursor.update_end_of_table();
         cursor
     }
 
@@ -368,10 +382,17 @@ impl<'a> Cursor<'a> {
     }
 
     fn insert(&mut self, cell: Cell) {
-        assert!(self.cell().is_none());
-        *self.cell() = Some(cell);
+        let cell_number = self.cell_number as usize;
+
+        // *self.cell() = Some(cell);
         match self.page().node {
-            Node::Leaf(ref mut leaf) => leaf.cell_count += 1,
+            Node::Leaf(ref mut leaf) => {
+                assert!(leaf.cell_count < LeafNode::MAX_CELLS as u32);
+                leaf.cells[cell_number..=leaf.cell_count as usize].rotate_right(1);
+                assert!(leaf.cells[cell_number].is_none());
+                leaf.cells[cell_number] = Some(cell);
+                leaf.cell_count += 1;
+            }
             Node::Internal(_) => unimplemented!(),
         };
     }
@@ -430,12 +451,12 @@ impl Table {
                 let email = email.as_bytes();
                 row.email[..email.len()].copy_from_slice(email);
 
-                let mut cursor = Cursor::table_end(self);
+                let mut cursor = Cursor::find(self, *id);
                 cursor.insert(Cell { key: *id, row });
             }
             Statement::Select => {
                 let mut row_count = 0;
-                let mut cursor = Cursor::table_start(self);
+                let mut cursor = Cursor::start(self);
                 while !cursor.end_of_table {
                     writeln!(output, " {}", cursor.cell().as_ref().unwrap().row).unwrap();
                     cursor.advance();
@@ -545,6 +566,25 @@ mod tests {
                 "db > ",
                 " [11 'john' 'john@john.com']",
                 "1 rows.",
+                "db > "
+            ]
+        );
+    }
+
+    #[test]
+    fn order() {
+        assert_eq!(
+            run(&[
+                "insert 11 john11 john11@john.com", 
+                "insert 10 john10 john10@john.com", 
+                "select", ".exit"]),
+            [
+                "db > ",
+                "db > ",
+                "db > ",
+                " [10 'john10' 'john10@john.com']",
+                " [11 'john11' 'john11@john.com']",
+                "2 rows.",
                 "db > "
             ]
         );
