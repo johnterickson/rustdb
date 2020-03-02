@@ -545,7 +545,10 @@ mod tests {
         let mut repl = Repl::new(&input_bytes[..], &mut output, pager);
         repl.run();
         let output = String::from_utf8(output).unwrap();
-        output.lines().map(|line| line.to_owned()).collect()
+        output.lines()
+            .filter(|line| line != &"db > ")
+            .map(|line| line.to_owned())
+            .collect()
     }
 
     fn run(input: &[&str]) -> Vec<String> {
@@ -554,7 +557,7 @@ mod tests {
 
     #[test]
     fn empty() {
-        assert_eq!(run(&["select", ".exit"]), ["db > ", "0 rows.", "db > "]);
+        assert_eq!(run(&["select", ".exit"]), ["0 rows."]);
     }
 
     #[test]
@@ -562,11 +565,8 @@ mod tests {
         assert_eq!(
             run(&["insert 11 john john@john.com", "select", ".exit"]),
             [
-                "db > ",
-                "db > ",
                 " [11 'john' 'john@john.com']",
                 "1 rows.",
-                "db > "
             ]
         );
     }
@@ -577,15 +577,15 @@ mod tests {
             run(&[
                 "insert 11 john11 john11@john.com", 
                 "insert 10 john10 john10@john.com", 
+                "insert 12 john12 john12@john.com", 
+                "insert 9 john9 john9@john.com", 
                 "select", ".exit"]),
             [
-                "db > ",
-                "db > ",
-                "db > ",
+                " [9 'john9' 'john9@john.com']",
                 " [10 'john10' 'john10@john.com']",
                 " [11 'john11' 'john11@john.com']",
-                "2 rows.",
-                "db > "
+                " [12 'john12' 'john12@john.com']",
+                "4 rows.",
             ]
         );
     }
@@ -599,16 +599,13 @@ mod tests {
                 &["insert 11 john john@john.com", "select", ".exit"]
             ),
             [
-                "db > ",
-                "db > ",
                 " [11 'john' 'john@john.com']",
                 "1 rows.",
-                "db > "
             ]
         );
         assert_eq!(
             run_from_file(tempdb.reopen().unwrap(), &["select", ".exit"]),
-            ["db > ", " [11 'john' 'john@john.com']", "1 rows.", "db > "]
+            [" [11 'john' 'john@john.com']", "1 rows."]
         );
     }
 }
