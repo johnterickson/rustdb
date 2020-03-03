@@ -130,14 +130,13 @@ impl LeafNode {
         }
     }
 
-    fn find(&mut self, key: Id) -> CellNumber {
+    fn find(&mut self, key: Id) -> (bool, CellNumber) {
         let cells = &self.cells[0..self.cell_count as usize];
         let search_result = cells.binary_search_by(|probe| probe.as_ref().unwrap().key.cmp(&key));
-        let cell_number = match search_result {
-            Ok(found) => found,
-            Err(insert_here) => insert_here,
-        };
-        cell_number as CellNumber
+        match search_result {
+            Ok(found) => (true, found as CellNumber),
+            Err(insert_here) => (false, insert_here as CellNumber),
+        }
     }
 
     fn serialize<W: Write>(&self, mut writer: W) {
@@ -338,10 +337,10 @@ impl<'a> Cursor<'a> {
     If the key is not present, return the position
     where it should be inserted
     */
-    fn find(table: &'a mut Table, key: Id) -> Cursor<'a> {
+    fn find(table: &'a mut Table, key: Id) -> (bool,Cursor<'a>) {
         let root_page = table.root_page;
         
-        let cell_number = match table.pager.get_page(root_page).node {
+        let (found, cell_number) = match table.pager.get_page(root_page).node {
             Node::Internal(_) => unimplemented!(),
             Node::Leaf(ref mut leaf) => leaf.find(key)
         };
@@ -353,7 +352,7 @@ impl<'a> Cursor<'a> {
             end_of_table: false,
         };
         cursor.update_end_of_table();
-        cursor
+        (found, cursor)
     }
 
     fn page(&mut self) -> &mut Page {
@@ -381,22 +380,56 @@ impl<'a> Cursor<'a> {
         self.update_end_of_table();
     }
 
-    fn insert(&mut self, cell: Cell) {
+    fn insert(&mut self, cell: Cell) -> Result<(),TableError> {
         let cell_number = self.cell_number as usize;
 
-        // *self.cell() = Some(cell);
         match self.page().node {
             Node::Leaf(ref mut leaf) => {
-                assert!(leaf.cell_count < LeafNode::MAX_CELLS as u32);
-                leaf.cells[cell_number..=leaf.cell_count as usize].rotate_right(1);
-                assert!(leaf.cells[cell_number].is_none());
-                leaf.cells[cell_number] = Some(cell);
-                leaf.cell_count += 1;
+
+                if leaf.cell_count == LeafNode::MAX_CELLS as u32 {
+                    Err(TableError::TableFull)
+                } else {
+                    leaf.cells[cell_number..=leaf.cell_count as usize].rotate_right(1);
+                    assert!(leaf.cells[cell_number].is_none());
+                    leaf.cells[cell_number] = Some(cell);
+                    leaf.cell_count += 1;
+                    Ok(())
+                }
             }
             Node::Internal(_) => unimplemented!(),
-        };
+        }
     }
 }
+
+// struct TableIterator<'a> {
+//     table: &'a mut Table,
+//     page_index: PageNumber,
+//     cell_number: CellNumber,
+//     first: bool,
+// }
+
+// impl<'a> Iterator for TableIterator<'a> {
+//     type Item = &'a mut Option<Cell>;
+//     fn next(&mut self) -> Option<Self::Item> {
+//         if self.first {
+//             self.first = false;
+//         } else {
+//             self.cell_number += 1;
+//         }
+
+//         let page = &mut self.table.pager.get_page(self.page_index);
+//         match page.node {
+//             Node::Leaf(ref mut leaf) => {
+//                 if self.cell_number < leaf.cell_count {
+//                     Some(&mut leaf.cells[self.cell_number as usize])
+//                 } else {
+//                     None
+//                 }
+//             },
+//             Node::Internal(_) => unimplemented!(),
+//         }
+//     }
+// }
 
 enum Statement {
     Insert(Id, String, String),
@@ -423,6 +456,11 @@ impl Statement {
     }
 }
 
+enum TableError {
+    IdAlreadyExists,
+    TableFull
+}
+
 struct Table {
     root_page: PageNumber,
     pager: Pager,
@@ -436,7 +474,7 @@ impl Table {
         }
     }
 
-    fn exec<W: Write>(&mut self, s: &Statement, output: &mut W) {
+    fn exec<W: Write>(&mut self, s: &Statement, output: &mut W) -> Result<(), TableError> {
         match s {
             Statement::Insert(id, name, email) => {
                 let mut row = Row {
@@ -451,8 +489,13 @@ impl Table {
                 let email = email.as_bytes();
                 row.email[..email.len()].copy_from_slice(email);
 
-                let mut cursor = Cursor::find(self, *id);
-                cursor.insert(Cell { key: *id, row });
+                let (found, mut cursor) = Cursor::find(self, *id);
+                if found {
+                    Err(TableError::IdAlreadyExists)
+                } else {
+                    cursor.insert(Cell { key: *id, row });
+                    Ok(())
+                }
             }
             Statement::Select => {
                 let mut row_count = 0;
@@ -463,6 +506,7 @@ impl Table {
                     row_count += 1;
                 }
                 writeln!(output, "{} rows.", row_count).unwrap();
+                Ok(())
             }
         }
     }
@@ -586,6 +630,20 @@ mod tests {
                 " [11 'john11' 'john11@john.com']",
                 " [12 'john12' 'john12@john.com']",
                 "4 rows.",
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate() {
+        assert_eq!(
+            run(&[
+                "insert 11 john11 john11@john.com", 
+                "insert 11 john11 john11@john.com", 
+                "select", ".exit"]),
+            [
+                " [11 'john11' 'john11@john.com']",
+                "1 rows.",
             ]
         );
     }
