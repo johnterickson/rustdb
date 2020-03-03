@@ -80,25 +80,25 @@ impl Row {
 
 #[repr(C)]
 #[derive(Default)]
-struct Cell {
+struct LeafCell {
     key: Id,
     row: Row,
 }
 
-const_assert!(size_of::<Cell>() == size_of::<Id>() + size_of::<Row>());
+const_assert!(size_of::<LeafCell>() == size_of::<Id>() + size_of::<Row>());
 
-impl Cell {
+impl LeafCell {
     const KEY_SIZE: usize = size_of::<Id>();
     const KEY_OFFSET: usize = 0;
     const VALUE_SIZE: usize = Row::SIZE;
-    const VALUE_OFFSET: usize = Cell::KEY_OFFSET + Cell::KEY_SIZE;
-    const SIZE: usize = Cell::VALUE_OFFSET + Cell::VALUE_SIZE;
+    const VALUE_OFFSET: usize = LeafCell::KEY_OFFSET + LeafCell::KEY_SIZE;
+    const SIZE: usize = LeafCell::VALUE_OFFSET + LeafCell::VALUE_SIZE;
 
-    fn deserialize<R: Read>(r: &mut R) -> std::io::Result<Cell> {
+    fn deserialize<R: Read>(r: &mut R) -> std::io::Result<LeafCell> {
         let mut id = [0u8; size_of::<Id>()];
         r.read_exact(&mut id)?;
         let row = Row::deserialize(r)?;
-        Ok(Cell {
+        Ok(LeafCell {
             key: Id::from_le_bytes(id),
             row,
         })
@@ -110,18 +110,46 @@ impl Cell {
     }
 }
 
-struct InternalNode {}
+struct InternalCell {
+    key: Id,
+    child: PageNumber
+}
+
+impl InternalCell {
+    const KEY_SIZE: usize = size_of::<Id>();
+    const KEY_OFFSET: usize = 0;
+    const CHILD_SIZE: usize = size_of::<PageNumber>();
+    const CHILD_OFFSET: usize = InternalCell::KEY_OFFSET + InternalCell::KEY_SIZE;
+    const SIZE: usize = InternalCell::CHILD_OFFSET + InternalCell::CHILD_SIZE;
+}
+
+const_assert!(size_of::<InternalCell>() == size_of::<Id>() + size_of::<PageNumber>());
+
+struct InternalNode {
+    children: [Option<InternalCell>; InternalNode::MAX_CELLS],
+    cell_count: u32,
+    right_child: Option<PageNumber>
+}
+
+impl InternalNode {
+    const HEADER_SIZE: usize = size_of::<u32>() + size_of::<PageNumber>();
+    const SPACE_FOR_CELLS: usize = PAGE_SIZE - Page::HEADER_SIZE - InternalNode::HEADER_SIZE;
+    const MAX_CELLS: usize = InternalNode::SPACE_FOR_CELLS / InternalCell::SIZE;
+    const WASTED_SPACE: usize = InternalNode::SPACE_FOR_CELLS - (InternalNode::MAX_CELLS * InternalCell::SIZE);
+}
 
 struct LeafNode {
-    cells: [Option<Cell>; LeafNode::MAX_CELLS],
+    cells: [Option<LeafCell>; LeafNode::MAX_CELLS],
     cell_count: u32,
 }
 
 impl LeafNode {
     const HEADER_SIZE: usize = size_of::<u32>();
     const SPACE_FOR_CELLS: usize = PAGE_SIZE - Page::HEADER_SIZE - LeafNode::HEADER_SIZE;
-    const MAX_CELLS: usize = LeafNode::SPACE_FOR_CELLS / Cell::SIZE;
-    const WASTED_SPACE: usize = LeafNode::SPACE_FOR_CELLS - (LeafNode::MAX_CELLS * Cell::SIZE);
+    const MAX_CELLS: usize = LeafNode::SPACE_FOR_CELLS / LeafCell::SIZE;
+    const WASTED_SPACE: usize = LeafNode::SPACE_FOR_CELLS - (LeafNode::MAX_CELLS * LeafCell::SIZE);
+    const RIGHT_SPLIT_COUNT: usize = (LeafNode::MAX_CELLS + 1) / 2;
+    const LEFT_SPLIT_COUNT: usize = LeafNode::MAX_CELLS + 1 - LeafNode::RIGHT_SPLIT_COUNT;
 
     fn create_empty() -> LeafNode {
         LeafNode {
@@ -146,7 +174,7 @@ impl LeafNode {
 
         for cell in &self.cells {
             cell.as_ref()
-                .unwrap_or(&Cell::default())
+                .unwrap_or(&LeafCell::default())
                 .serialize(&mut writer)
                 .unwrap();
         }
@@ -161,7 +189,7 @@ impl LeafNode {
 
         let mut node = LeafNode::create_empty();
         for i in 0..cell_count {
-            node.cells[i as usize] = Some(Cell::deserialize(&mut reader).unwrap());
+            node.cells[i as usize] = Some(LeafCell::deserialize(&mut reader).unwrap());
         }
         node.cell_count = cell_count;
 
@@ -238,6 +266,7 @@ struct Pager {
     file: File,
     pages: [Option<Box<Page>>; Pager::MAX_PAGES as usize],
     file_length: u64,
+    page_count: PageNumber,
 }
 
 impl Pager {
@@ -245,10 +274,13 @@ impl Pager {
 
     fn from_file(file: File) -> Pager {
         let file_length = file.metadata().unwrap().len();
+        assert!(file_length % PAGE_SIZE as u64 == 0);
+        let page_count = file_length / PAGE_SIZE as u64;
         Pager {
             file,
             pages: array![None; Pager::MAX_PAGES as usize],
             file_length,
+            page_count: page_count as PageNumber
         }
     }
 
@@ -262,32 +294,44 @@ impl Pager {
         Pager::from_file(file)
     }
 
-    fn get_page(&mut self, page_num: PageNumber) -> &mut Page {
+    fn alloc(&mut self, p: Page) -> (PageNumber, &mut Page) {
+        let page_num = self.page_count;
+
+        let file_offset = (PAGE_SIZE as u64) * (page_num as u64);
+        assert!(file_offset == self.file_length);
+
+        let needed_file_length = file_offset + (PAGE_SIZE as u64);
+        self.file.set_len(needed_file_length).unwrap();
+        self.file_length = needed_file_length;
+        self.page_count += 1;
+        assert!(self.pages[page_num as usize].is_none());
+        let page = &mut self.pages[page_num as usize];
+        *page = Some(Box::new(p));
+        (page_num,self.get_page(page_num).unwrap())
+    }
+
+    fn get_page(&mut self, page_num: PageNumber) -> Option<&mut Page> {
         assert!(page_num < Pager::MAX_PAGES);
 
         let page = &mut self.pages[page_num as usize];
 
         if let Some(page) = page {
-            page
+            Some(page)
         } else {
             // expand file as needed
             let file_offset = (PAGE_SIZE as u64) * (page_num as u64);
             let needed_file_length = file_offset + (PAGE_SIZE as u64);
 
-            let faulted_page = if needed_file_length > self.file_length {
-                // create a new page
-                assert!(needed_file_length == self.file_length + (PAGE_SIZE as u64));
-                self.file.set_len(needed_file_length).unwrap();
-                self.file_length = needed_file_length;
-                Page::create_leaf(None)
-            } else {
-                // read in an existing page
-                self.file.seek(SeekFrom::Start(file_offset)).unwrap();
-                Page::deserialize(&mut self.file)
-            };
+            if needed_file_length > self.file_length {
+                return None;
+            }
+
+            // read in an existing page
+            self.file.seek(SeekFrom::Start(file_offset)).unwrap();
+            let faulted_page = Page::deserialize(&mut self.file);
 
             *page = Some(Box::new(faulted_page));
-            page.as_mut().unwrap()
+            Some(page.as_mut().unwrap())
         }
     }
 
@@ -340,7 +384,7 @@ impl<'a> Cursor<'a> {
     fn find(table: &'a mut Table, key: Id) -> (bool,Cursor<'a>) {
         let root_page = table.root_page;
         
-        let (found, cell_number) = match table.pager.get_page(root_page).node {
+        let (found, cell_number) = match table.pager.get_page(root_page).unwrap().node {
             Node::Internal(_) => unimplemented!(),
             Node::Leaf(ref mut leaf) => leaf.find(key)
         };
@@ -356,10 +400,10 @@ impl<'a> Cursor<'a> {
     }
 
     fn page(&mut self) -> &mut Page {
-        self.table.pager.get_page(self.page_index)
+        self.table.pager.get_page(self.page_index).unwrap()
     }
 
-    fn cell(&mut self) -> &mut Option<Cell> {
+    fn cell(&mut self) -> &mut Option<LeafCell> {
         let cell_number = self.cell_number;
         match self.page().node {
             Node::Internal(_) => unimplemented!(),
@@ -380,13 +424,15 @@ impl<'a> Cursor<'a> {
         self.update_end_of_table();
     }
 
-    fn insert(&mut self, cell: Cell) -> Result<(),TableError> {
+    fn insert(&mut self, cell: LeafCell) -> Result<(),TableError> {
         let cell_number = self.cell_number as usize;
 
         match self.page().node {
             Node::Leaf(ref mut leaf) => {
 
                 if leaf.cell_count == LeafNode::MAX_CELLS as u32 {
+                    let left = self.table.pager.alloc(Page::create_leaf(Some(self.page_index)));
+                    let right = self.table.pager.alloc(Page::create_leaf(Some(self.page_index)));
                     Err(TableError::TableFull)
                 } else {
                     leaf.cells[cell_number..=leaf.cell_count as usize].rotate_right(1);
@@ -468,9 +514,28 @@ struct Table {
 }
 
 impl Table {
-    fn new(pager: Pager) -> Table {
+    fn new(mut pager: Pager) -> Table {
+
+        // todo: keeping root at page_num 0 would be good
+
+        let mut root_page = None;
+
+        let mut page_num =0;
+        while let Some(page) = pager.get_page(page_num) {
+            if page.parent.is_none() {
+                root_page = Some(page_num);
+                break;
+            }
+            page_num += 1;
+        }
+
+        let root_page = root_page.unwrap_or_else(|| {
+            let (root_page, _) = pager.alloc(Page::create_leaf(None));
+            root_page
+        });
+
         Table {
-            root_page: 0,
+            root_page,
             pager,
         }
     }
@@ -494,7 +559,7 @@ impl Table {
                 if found {
                     Err(TableError::IdAlreadyExists)
                 } else {
-                    cursor.insert(Cell { key: *id, row })
+                    cursor.insert(LeafCell { key: *id, row })
                 }
             }
             Statement::Select => {
@@ -638,7 +703,6 @@ mod tests {
 
     #[test]
     fn full_leaf() {
-
         let mut commands: Vec<_> = 
              (0..=LeafNode::MAX_CELLS)
             .map(|i| format!("insert {} john{} john{}@john.com", i, i, i))
@@ -651,7 +715,6 @@ mod tests {
             .map(|i| format!(" [{} 'john{}' 'john{}@john.com']", i, i, i))
             .collect();
 
-        outputs.insert(0, "Error: TableFull".to_owned());
         outputs.push(format!("{} rows.", LeafNode::MAX_CELLS));
 
         assert_eq!(
