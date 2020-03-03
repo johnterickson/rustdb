@@ -456,6 +456,7 @@ impl Statement {
     }
 }
 
+#[derive(Debug)]
 enum TableError {
     IdAlreadyExists,
     TableFull
@@ -493,8 +494,7 @@ impl Table {
                 if found {
                     Err(TableError::IdAlreadyExists)
                 } else {
-                    cursor.insert(Cell { key: *id, row });
-                    Ok(())
+                    cursor.insert(Cell { key: *id, row })
                 }
             }
             Statement::Select => {
@@ -547,7 +547,9 @@ impl<R: BufRead, W: Write> Repl<R, W> {
                             }
                         } else {
                             if let Some(stmt) = Statement::parse(&line) {
-                                self.table.exec(&stmt, &mut self.output);
+                                if let Err(e) = self.table.exec(&stmt, &mut self.output) {
+                                    writeln!(&mut self.output, "Error: {:?}", &e).unwrap();
+                                }
                             }
                         }
                     }
@@ -578,11 +580,11 @@ mod tests {
     use super::*;
     use tempfile::tempfile;
 
-    fn run_from_file(file: File, input: &[&str]) -> Vec<String> {
+    fn run_from_file<S: AsRef<str>>(file: File, input: &[S]) -> Vec<String> {
         let pager = Pager::from_file(file);
         let mut input_bytes = Vec::new();
         for line in input {
-            input_bytes.extend_from_slice(line.as_bytes());
+            input_bytes.extend_from_slice(line.as_ref().as_bytes());
             input_bytes.push('\n' as u8);
         }
         let mut output = Vec::new();
@@ -595,7 +597,7 @@ mod tests {
             .collect()
     }
 
-    fn run(input: &[&str]) -> Vec<String> {
+    fn run<S: AsRef<str>>(input: &[S]) -> Vec<String> {
         run_from_file(tempfile().unwrap(), input)
     }
 
@@ -635,6 +637,30 @@ mod tests {
     }
 
     #[test]
+    fn full_leaf() {
+
+        let mut commands: Vec<_> = 
+             (0..=LeafNode::MAX_CELLS)
+            .map(|i| format!("insert {} john{} john{}@john.com", i, i, i))
+            .collect();
+        commands.push("select".to_owned());
+        commands.push(".exit".to_owned());
+
+        let mut outputs: Vec<_> =
+            (0..LeafNode::MAX_CELLS)
+            .map(|i| format!(" [{} 'john{}' 'john{}@john.com']", i, i, i))
+            .collect();
+
+        outputs.insert(0, "Error: TableFull".to_owned());
+        outputs.push(format!("{} rows.", LeafNode::MAX_CELLS));
+
+        assert_eq!(
+            run(&commands),
+            outputs
+        );
+    }
+
+    #[test]
     fn duplicate() {
         assert_eq!(
             run(&[
@@ -642,6 +668,7 @@ mod tests {
                 "insert 11 john11 john11@john.com", 
                 "select", ".exit"]),
             [
+                "Error: IdAlreadyExists",
                 " [11 'john11' 'john11@john.com']",
                 "1 rows.",
             ]
