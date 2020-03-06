@@ -5,7 +5,7 @@ extern crate static_assertions;
 
 use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::path::Path;
 use std::process;
@@ -16,6 +16,22 @@ type PageNumber = u32;
 type CellNumber = u32;
 
 const PAGE_SIZE: usize = 4096;
+
+#[derive(Debug)]
+enum TableError {
+    Io(io::Error),
+    IdAlreadyExists,
+    TableFull,
+    RootPageNotFound,
+}
+
+impl From<io::Error> for TableError {
+    fn from(error: io::Error) -> Self {
+        TableError::Io(error)
+    }
+}
+
+type TableResult<T> = Result<T, TableError>;
 
 #[repr(C)]
 struct Row {
@@ -172,39 +188,37 @@ impl InternalNode {
         }
     }
 
-    fn serialize<W: Write>(&self, mut writer: W) {
+    fn serialize<W: Write>(&self, mut writer: W) -> TableResult<()> {
         let mut child_count = [0u8; size_of::<u32>()];
         child_count[0..4].copy_from_slice(&self.child_count.to_le_bytes());
-        writer.write_all(&child_count).unwrap();
+        writer.write_all(&child_count)?;
 
         for child in self.children.iter() {
             child
                 .as_ref()
                 .unwrap_or(&InternalCell::default())
-                .serialize(&mut writer)
-                .unwrap();
+                .serialize(&mut writer)?;
         }
 
-        writer
-            .write_all(&[0u8; InternalNode::WASTED_SPACE])
-            .unwrap();
+        writer.write_all(&[0u8; InternalNode::WASTED_SPACE])?;
+        Ok(())
     }
 
-    fn deserialize<R: Read>(mut reader: R) -> InternalNode {
+    fn deserialize<R: Read>(mut reader: R) -> TableResult<InternalNode> {
         let mut child_count = [0u8; size_of::<u32>()];
-        reader.read_exact(&mut child_count[..]).unwrap();
+        reader.read_exact(&mut child_count[..])?;
         let child_count = u32::from_le_bytes(child_count);
 
         let mut node = InternalNode::create_empty();
         for i in 0..child_count {
-            node.children[i as usize] = Some(InternalCell::deserialize(&mut reader).unwrap());
+            node.children[i as usize] = Some(InternalCell::deserialize(&mut reader)?);
         }
         node.child_count = child_count;
 
         let mut padding = [0u8; InternalNode::WASTED_SPACE];
-        reader.read_exact(&mut padding).unwrap();
+        reader.read_exact(&mut padding)?;
 
-        node
+        Ok(node)
     }
 }
 
@@ -239,45 +253,45 @@ impl LeafNode {
         }
     }
 
-    fn serialize<W: Write>(&self, mut writer: W) {
+    fn serialize<W: Write>(&self, mut writer: W) -> TableResult<()> {
         let mut cell_count = [0u8; size_of::<u32>()];
         cell_count[0..4].copy_from_slice(&self.cell_count.to_le_bytes());
-        writer.write_all(&cell_count).unwrap();
+        writer.write_all(&cell_count)?;
 
         let mut next_leaf = [0u8; size_of::<u32>()];
         next_leaf[0..4].copy_from_slice(&self.next_leaf.to_le_bytes());
-        writer.write_all(&next_leaf).unwrap();
+        writer.write_all(&next_leaf)?;
 
         for cell in &self.cells {
             cell.as_ref()
                 .unwrap_or(&LeafCell::default())
-                .serialize(&mut writer)
-                .unwrap();
+                .serialize(&mut writer)?;
         }
 
-        writer.write_all(&[0u8; LeafNode::WASTED_SPACE]).unwrap();
+        writer.write_all(&[0u8; LeafNode::WASTED_SPACE])?;
+        Ok(())
     }
 
-    fn deserialize<R: Read>(mut reader: R) -> LeafNode {
+    fn deserialize<R: Read>(mut reader: R) -> TableResult<LeafNode> {
         let mut cell_count = [0u8; size_of::<u32>()];
-        reader.read_exact(&mut cell_count[..]).unwrap();
+        reader.read_exact(&mut cell_count[..])?;
         let cell_count = u32::from_le_bytes(cell_count);
 
         let mut next_leaf = [0u8; size_of::<u32>()];
-        reader.read_exact(&mut next_leaf[..]).unwrap();
+        reader.read_exact(&mut next_leaf[..])?;
         let next_leaf = u32::from_le_bytes(next_leaf);
 
         let mut node = LeafNode::create_empty();
         for i in 0..cell_count {
-            node.cells[i as usize] = Some(LeafCell::deserialize(&mut reader).unwrap());
+            node.cells[i as usize] = Some(LeafCell::deserialize(&mut reader)?);
         }
         node.cell_count = cell_count;
         node.next_leaf = next_leaf;
 
         let mut padding = [0u8; LeafNode::WASTED_SPACE];
-        reader.read_exact(&mut padding).unwrap();
+        reader.read_exact(&mut padding)?;
 
-        node
+        Ok(node)
     }
 }
 
@@ -287,7 +301,7 @@ enum Node {
 }
 
 impl Node {
-    fn serialize<W: Write>(&self, writer: W) {
+    fn serialize<W: Write>(&self, writer: W) -> TableResult<()> {
         match self {
             Node::Internal(i) => i.serialize(writer),
             Node::Leaf(leaf) => leaf.serialize(writer),
@@ -333,7 +347,7 @@ impl Page {
         }
     }
 
-    fn serialize<W: Write>(&self, mut writer: W) {
+    fn serialize<W: Write>(&self, mut writer: W) -> TableResult<()> {
         let mut buf = [0u8; Page::HEADER_SIZE];
         buf[0] = match self.node {
             Node::Internal(_) => 0,
@@ -344,13 +358,13 @@ impl Page {
             None => 1,
         };
         buf[2..].copy_from_slice(&self.parent.unwrap_or(0).to_le_bytes());
-        writer.write_all(&buf).unwrap();
-        self.node.serialize(&mut writer);
+        writer.write_all(&buf)?;
+        self.node.serialize(&mut writer)
     }
 
-    fn deserialize<R: Read>(mut reader: R) -> Page {
+    fn deserialize<R: Read>(mut reader: R) -> TableResult<Page> {
         let mut buf = [0u8; Page::HEADER_SIZE];
-        reader.read_exact(&mut buf[..]).unwrap();
+        reader.read_exact(&mut buf[..])?;
         let is_root = buf[1] == 1;
         let parent = if is_root {
             None
@@ -361,12 +375,12 @@ impl Page {
         };
 
         let node = match buf[0] {
-            0 => Node::Internal(InternalNode::deserialize(reader)),
-            1 => Node::Leaf(LeafNode::deserialize(reader)),
+            0 => Node::Internal(InternalNode::deserialize(reader)?),
+            1 => Node::Leaf(LeafNode::deserialize(reader)?),
             node_type => panic!("unknown node type {}", node_type),
         };
 
-        Page { node, parent }
+        Ok(Page { node, parent })
     }
 }
 
@@ -380,85 +394,88 @@ struct Pager {
 impl Pager {
     const MAX_PAGES: PageNumber = 100;
 
-    fn from_file(file: File) -> Pager {
-        let file_length = file.metadata().unwrap().len();
+    fn from_file(file: File) -> TableResult<Pager> {
+        let file_length = file.metadata()?.len();
         assert!(file_length % PAGE_SIZE as u64 == 0);
         let page_count = file_length / PAGE_SIZE as u64;
-        Pager {
+        Ok(Pager {
             file,
             pages: array![None; Pager::MAX_PAGES as usize],
             file_length,
             page_count: page_count as PageNumber,
-        }
+        })
     }
 
-    fn open<P: AsRef<Path>>(path: P) -> Pager {
+    fn open<P: AsRef<Path>>(path: P) -> TableResult<Pager> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .open(path)
-            .unwrap();
+            .open(path)?;
         Pager::from_file(file)
     }
 
-    fn alloc(&mut self, p: Page) -> (PageNumber, &mut Page) {
+    fn alloc(&mut self, p: Page) -> TableResult<(PageNumber, &mut Page)> {
         let page_num = self.page_count;
+        if page_num == Pager::MAX_PAGES {
+            return Err(TableError::TableFull);
+        }
 
         let file_offset = (PAGE_SIZE as u64) * (page_num as u64);
         assert!(file_offset == self.file_length);
 
         let needed_file_length = file_offset + (PAGE_SIZE as u64);
-        self.file.set_len(needed_file_length).unwrap();
+        self.file.set_len(needed_file_length)?;
         self.file_length = needed_file_length;
         self.page_count += 1;
         assert!(self.pages[page_num as usize].is_none());
         let page = &mut self.pages[page_num as usize];
         *page = Some(Box::new(p));
-        (page_num, self.get_page(page_num).unwrap())
+        Ok((page_num, self.get_page(page_num)?.unwrap()))
     }
 
-    fn get_page(&mut self, page_num: PageNumber) -> Option<&mut Page> {
+    fn get_page(&mut self, page_num: PageNumber) -> TableResult<Option<&mut Page>> {
         assert!(page_num < Pager::MAX_PAGES);
 
         let page = &mut self.pages[page_num as usize];
 
         if let Some(page) = page {
-            Some(page)
+            Ok(Some(page))
         } else {
             // expand file as needed
             let file_offset = (PAGE_SIZE as u64) * (page_num as u64);
             let needed_file_length = file_offset + (PAGE_SIZE as u64);
 
             if needed_file_length > self.file_length {
-                return None;
+                return Ok(None);
             }
 
             // read in an existing page
-            self.file.seek(SeekFrom::Start(file_offset)).unwrap();
-            let faulted_page = Page::deserialize(&mut self.file);
+            self.file.seek(SeekFrom::Start(file_offset))?;
+            let faulted_page = Page::deserialize(&mut self.file)?;
 
             *page = Some(Box::new(faulted_page));
-            Some(page.as_mut().unwrap())
+            Ok(Some(page.as_mut().unwrap()))
         }
     }
 
-    fn flush_all(&mut self) {
+    fn flush_all(&mut self) -> TableResult<()> {
         for page in self.pages.iter().enumerate() {
             if let (page_num, Some(page)) = page {
                 let file_offset = (PAGE_SIZE as u64) * (page_num as u64);
-                self.file.seek(SeekFrom::Start(file_offset)).unwrap();
-                page.serialize(&mut self.file);
+                self.file.seek(SeekFrom::Start(file_offset))?;
+                page.serialize(&mut self.file)?;
             }
         }
 
-        self.file.flush().unwrap();
+        self.file.flush()?;
+        Ok(())
     }
 }
 
 impl Drop for Pager {
     fn drop(&mut self) {
-        self.flush_all();
+        self.flush_all().unwrap();
     }
 }
 
@@ -470,13 +487,17 @@ struct Cursor<'a> {
 }
 
 impl<'a> Cursor<'a> {
-    fn start(table: &'a mut Table) -> Cursor<'a> {
-        let (_, cursor) = Cursor::find(table, 0);
-        cursor
+    fn start(table: &'a mut Table) -> TableResult<Cursor<'a>> {
+        let (_, cursor) = Cursor::find(table, 0)?;
+        Ok(cursor)
     }
 
-    fn find_from_page(table: &'a mut Table, page_num: PageNumber, key: Id) -> (bool, Cursor<'a>) {
-        match table.pager.get_page(page_num).unwrap().node {
+    fn find_from_page(
+        table: &'a mut Table,
+        page_num: PageNumber,
+        key: Id,
+    ) -> TableResult<(bool, Cursor<'a>)> {
+        match table.pager.get_page(page_num)?.unwrap().node {
             Node::Internal(ref internal) => {
                 let (_, child_number) = internal.find(key);
                 let child_cell = internal.children[child_number as usize].as_ref().unwrap();
@@ -491,8 +512,8 @@ impl<'a> Cursor<'a> {
                     cell_number: cell_number,
                     end_of_table: false,
                 };
-                cursor.update_end_of_table();
-                return (found, cursor);
+                cursor.update_end_of_table()?;
+                return Ok((found, cursor));
             }
         };
     }
@@ -502,59 +523,61 @@ impl<'a> Cursor<'a> {
     If the key is not present, return the position
     where it should be inserted
     */
-    fn find(table: &'a mut Table, key: Id) -> (bool, Cursor<'a>) {
+    fn find(table: &'a mut Table, key: Id) -> TableResult<(bool, Cursor<'a>)> {
         Cursor::find_from_page(table, table.root_page, key)
     }
 
-    fn page(&mut self) -> &mut Page {
-        self.table.pager.get_page(self.page_index).unwrap()
+    fn page(&mut self) -> TableResult<&mut Page> {
+        Ok(self.table.pager.get_page(self.page_index)?.unwrap())
     }
 
-    fn cell(&mut self) -> &mut Option<LeafCell> {
+    fn cell(&mut self) -> TableResult<&mut Option<LeafCell>> {
         let cell_number = self.cell_number;
-        match self.page().node {
+        Ok(match self.page()?.node {
             Node::Internal(_) => unimplemented!(),
             Node::Leaf(ref mut leaf) => &mut leaf.cells[cell_number as usize],
-        }
+        })
     }
 
-    fn update_end_of_table(&mut self) {
+    fn update_end_of_table(&mut self) -> TableResult<()> {
         let cell_number = self.cell_number;
-        self.end_of_table = match self.page().node {
+        self.end_of_table = match self.page()?.node {
             Node::Internal(_) => unreachable!(),
             Node::Leaf(ref leaf) => cell_number >= leaf.cell_count,
         };
+        Ok(())
     }
 
-    fn leaf_node(&mut self) -> &LeafNode {
-        match self.page().node {
+    fn leaf_node(&mut self) -> TableResult<&LeafNode> {
+        Ok(match self.page()?.node {
             Node::Internal(_) => unreachable!(),
             Node::Leaf(ref leaf) => leaf,
-        }
+        })
     }
 
-    fn advance(&mut self) {
+    fn advance(&mut self) -> TableResult<()> {
         if self.end_of_table {
-            return;
+            return Ok(());
         }
 
         self.cell_number += 1;
-        if self.cell_number < self.leaf_node().cell_count {
-            return;
+        if self.cell_number < self.leaf_node()?.cell_count {
+            return Ok(());
         }
 
         self.cell_number = 0;
-        let next_leaf = self.leaf_node().next_leaf;
+        let next_leaf = self.leaf_node()?.next_leaf;
         self.end_of_table = next_leaf == 0;
         self.page_index = next_leaf;
+        Ok(())
     }
 
-    fn insert(&mut self, cell: LeafCell) -> Result<(), TableError> {
+    fn insert(&mut self, cell: LeafCell) -> TableResult<()> {
         let cell_number = self.cell_number as usize;
 
         // let's see if there's room in this node
         {
-            match self.page().node {
+            match self.page()?.node {
                 Node::Leaf(ref mut leaf) => {
                     if leaf.cell_count < LeafNode::MAX_CELLS as u32 {
                         leaf.cells[cell_number..=leaf.cell_count as usize].rotate_right(1);
@@ -573,7 +596,7 @@ impl<'a> Cursor<'a> {
         let mut right = LeafNode::create_empty();
         let mut cell = Some(cell);
         {
-            match self.page().node {
+            match self.page()?.node {
                 Node::Leaf(ref mut leaf) => {
                     right.next_leaf = leaf.next_leaf;
 
@@ -611,8 +634,8 @@ impl<'a> Cursor<'a> {
 
         // next, we want to create a new parent that will point to this node and to new right node
 
-        let original_parent = self.page().parent;
-        let left_max = self.page().node.max_key().unwrap();
+        let original_parent = self.page()?.parent;
+        let left_max = self.page()?.node.max_key().unwrap();
         let right = Node::Leaf(right);
         let right_max = right.max_key().unwrap();
 
@@ -620,7 +643,7 @@ impl<'a> Cursor<'a> {
         let (right_page_num, _) = self.table.pager.alloc(Page {
             node: right,
             parent: None,
-        });
+        })?;
 
         let mut new_internal_node = InternalNode::create_empty();
         new_internal_node.child_count = 2;
@@ -639,9 +662,9 @@ impl<'a> Cursor<'a> {
         };
 
         // update parent and pointers
-        let (new_page_num, _) = self.table.pager.alloc(new_page);
+        let (new_page_num, _) = self.table.pager.alloc(new_page)?;
         {
-            let left = self.table.pager.get_page(left_page_num).unwrap();
+            let left = self.table.pager.get_page(left_page_num)?.unwrap();
             left.parent = Some(new_page_num);
             if let Node::Leaf(ref mut left) = left.node {
                 left.next_leaf = right_page_num;
@@ -649,7 +672,7 @@ impl<'a> Cursor<'a> {
                 assert!(false);
             }
         }
-        self.table.pager.get_page(right_page_num).unwrap().parent = Some(new_page_num);
+        self.table.pager.get_page(right_page_num)?.unwrap().parent = Some(new_page_num);
 
         // update next leaf pointer
 
@@ -660,36 +683,6 @@ impl<'a> Cursor<'a> {
         Ok(())
     }
 }
-
-// struct TableIterator<'a> {
-//     table: &'a mut Table,
-//     page_index: PageNumber,
-//     cell_number: CellNumber,
-//     first: bool,
-// }
-
-// impl<'a> Iterator for TableIterator<'a> {
-//     type Item = &'a mut Option<Cell>;
-//     fn next(&mut self) -> Option<Self::Item> {
-//         if self.first {
-//             self.first = false;
-//         } else {
-//             self.cell_number += 1;
-//         }
-
-//         let page = &mut self.table.pager.get_page(self.page_index);
-//         match page.node {
-//             Node::Leaf(ref mut leaf) => {
-//                 if self.cell_number < leaf.cell_count {
-//                     Some(&mut leaf.cells[self.cell_number as usize])
-//                 } else {
-//                     None
-//                 }
-//             },
-//             Node::Internal(_) => unimplemented!(),
-//         }
-//     }
-// }
 
 enum Statement {
     Insert(Id, String, String),
@@ -716,25 +709,19 @@ impl Statement {
     }
 }
 
-#[derive(Debug)]
-enum TableError {
-    IdAlreadyExists,
-    TableFull,
-}
-
 struct Table {
     root_page: PageNumber,
     pager: Pager,
 }
 
 impl Table {
-    fn new(mut pager: Pager) -> Table {
+    fn new(mut pager: Pager) -> TableResult<Table> {
         // todo: keeping root at page_num 0 would be good
 
         let mut root_page = None;
 
         let mut page_num = 0;
-        while let Some(page) = pager.get_page(page_num) {
+        while let Some(page) = pager.get_page(page_num)? {
             if page.parent.is_none() {
                 root_page = Some(page_num);
                 break;
@@ -742,15 +729,22 @@ impl Table {
             page_num += 1;
         }
 
-        let root_page = root_page.unwrap_or_else(|| {
-            let (root_page, _) = pager.alloc(Page::create_leaf(None));
-            root_page
-        });
+        let root_page = match root_page {
+            Some(p) => p,
+            None => {
+                if page_num > 0 {
+                    return Err(TableError::RootPageNotFound);
+                } else {
+                    let (new_root, _) = pager.alloc(Page::create_leaf(None))?;
+                    new_root
+                }
+            }
+        };
 
-        Table { root_page, pager }
+        Ok(Table { root_page, pager })
     }
 
-    fn exec<W: Write>(&mut self, s: &Statement, output: &mut W) -> Result<(), TableError> {
+    fn exec<W: Write>(&mut self, s: &Statement, output: &mut W) -> TableResult<()> {
         match s {
             Statement::Insert(id, name, email) => {
                 let mut row = Row {
@@ -765,7 +759,7 @@ impl Table {
                 let email = email.as_bytes();
                 row.email[..email.len()].copy_from_slice(email);
 
-                let (found, mut cursor) = Cursor::find(self, *id);
+                let (found, mut cursor) = Cursor::find(self, *id)?;
                 if found {
                     Err(TableError::IdAlreadyExists)
                 } else {
@@ -774,13 +768,13 @@ impl Table {
             }
             Statement::Select => {
                 let mut row_count = 0;
-                let mut cursor = Cursor::start(self);
+                let mut cursor = Cursor::start(self)?;
                 while !cursor.end_of_table {
-                    writeln!(output, " {}", cursor.cell().as_ref().unwrap().row).unwrap();
-                    cursor.advance();
+                    writeln!(output, " {}", cursor.cell()?.as_ref().unwrap().row)?;
+                    cursor.advance()?;
                     row_count += 1;
                 }
-                writeln!(output, "{} rows.", row_count).unwrap();
+                writeln!(output, "{} rows.", row_count)?;
                 Ok(())
             }
         }
@@ -794,22 +788,22 @@ struct Repl<R: BufRead, W: Write> {
 }
 
 impl<R: BufRead, W: Write> Repl<R, W> {
-    fn new(input: R, output: W, pager: Pager) -> Repl<R, W> {
-        Repl {
-            table: Table::new(pager),
+    fn new(input: R, output: W, pager: Pager) -> TableResult<Repl<R, W>> {
+        Ok(Repl {
+            table: Table::new(pager)?,
             input,
             output,
-        }
+        })
     }
 
-    fn run(&mut self) -> i32 {
+    fn run(&mut self) -> TableResult<i32> {
         loop {
-            write!(&mut self.output, "db > ").unwrap();
-            self.output.flush().unwrap();
+            write!(&mut self.output, "db > ")?;
+            self.output.flush()?;
             let mut line = String::new();
             match self.input.read_line(&mut line) {
                 Ok(_) => {
-                    writeln!(&mut self.output).unwrap();
+                    writeln!(&mut self.output)?;
 
                     if let Some(c) = line.chars().next() {
                         if c == '.' {
@@ -820,30 +814,27 @@ impl<R: BufRead, W: Write> Repl<R, W> {
                                         &mut self.output,
                                         "LeafNode::LEFT_SPLIT_COUNT: {}",
                                         &LeafNode::LEFT_SPLIT_COUNT
-                                    )
-                                    .unwrap();
+                                    )?;
                                     writeln!(
                                         &mut self.output,
                                         "LeafNode::RIGHT_SPLIT_COUNT: {}",
                                         &LeafNode::RIGHT_SPLIT_COUNT
-                                    )
-                                    .unwrap();
+                                    )?;
                                     writeln!(
                                         &mut self.output,
                                         "LeafNode::MAX_CELLS: {}",
                                         &LeafNode::MAX_CELLS
-                                    )
-                                    .unwrap();
+                                    )?;
                                 }
-                                ".exit" => return 0,
+                                ".exit" => return Ok(0),
                                 _ => {
-                                    write!(&mut self.output, "Unknown command: {}", &line).unwrap()
+                                    write!(&mut self.output, "Unknown command: {}", &line)?;
                                 }
                             }
                         } else {
                             if let Some(stmt) = Statement::parse(&line) {
                                 if let Err(e) = self.table.exec(&stmt, &mut self.output) {
-                                    writeln!(&mut self.output, "Error: {:?}", &e).unwrap();
+                                    writeln!(&mut self.output, "Error: {:?}", &e)?;
                                 }
                             }
                         }
@@ -857,17 +848,23 @@ impl<R: BufRead, W: Write> Repl<R, W> {
     }
 }
 
-fn real_main() -> i32 {
+fn real_main() -> TableResult<i32> {
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
 
-    let pager = Pager::open("db.bin");
-    let mut repl = Repl::new(stdin.lock(), stdout, pager);
+    let pager = Pager::open("db.bin")?;
+    let mut repl = Repl::new(stdin.lock(), stdout, pager)?;
     repl.run()
 }
 
 fn main() {
-    process::exit(real_main());
+    process::exit(match real_main() {
+        Ok(exit_code) => exit_code,
+        Err(e) => {
+            println!("Error: {:?}", &e);
+            1
+        }
+    });
 }
 
 #[cfg(test)]
@@ -876,15 +873,15 @@ mod tests {
     use tempfile::tempfile;
 
     fn run_from_file<S: AsRef<str>>(file: File, input: &[S]) -> Vec<String> {
-        let pager = Pager::from_file(file);
+        let pager = Pager::from_file(file).unwrap();
         let mut input_bytes = Vec::new();
         for line in input {
             input_bytes.extend_from_slice(line.as_ref().as_bytes());
             input_bytes.push('\n' as u8);
         }
         let mut output = Vec::new();
-        let mut repl = Repl::new(&input_bytes[..], &mut output, pager);
-        repl.run();
+        let mut repl = Repl::new(&input_bytes[..], &mut output, pager).unwrap();
+        repl.run().unwrap();
         let output = String::from_utf8(output).unwrap();
         output
             .lines()
