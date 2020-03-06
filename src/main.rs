@@ -482,7 +482,7 @@ impl<'a> Cursor<'a> {
                 let child_cell = internal.children[child_number as usize].as_ref().unwrap();
                 let child_page_num = child_cell.child;
                 return Cursor::find_from_page(table, child_page_num, key);
-            },
+            }
             Node::Leaf(ref leaf) => {
                 let (found, cell_number) = leaf.find(key);
                 let mut cursor = Cursor {
@@ -492,7 +492,7 @@ impl<'a> Cursor<'a> {
                     end_of_table: false,
                 };
                 cursor.update_end_of_table();
-                return (found, cursor)
+                return (found, cursor);
             }
         };
     }
@@ -938,10 +938,10 @@ mod tests {
             .map(|i| format!("insert {} john{} john{}@john.com", i, i, i))
             .collect();
         let expected = {
-            let mut expected : Vec<_> = (0..=LeafNode::MAX_CELLS)
+            let mut expected: Vec<_> = (0..=LeafNode::MAX_CELLS)
                 .map(|i| format!(" [{} 'john{}' 'john{}@john.com']", i, i, i))
                 .collect();
-            expected.push(format!("{} rows.", LeafNode::MAX_CELLS+1));
+            expected.push(format!("{} rows.", LeafNode::MAX_CELLS + 1));
             expected
         };
 
@@ -949,26 +949,14 @@ mod tests {
             let mut commands = inserts.clone();
             commands.push("select".to_owned());
             commands.push(".exit".to_owned());
-            assert_eq!(
-                run_from_file(
-                    tempdb.reopen().unwrap(),
-                    &commands
-                ),
-                expected
-            );
+            assert_eq!(run_from_file(tempdb.reopen().unwrap(), &commands), expected);
         }
 
         {
             let mut commands = Vec::new();
             commands.push("select".to_owned());
             commands.push(".exit".to_owned());
-            assert_eq!(
-                run_from_file(
-                    tempdb.reopen().unwrap(),
-                    &commands
-                ),
-                expected
-            );
+            assert_eq!(run_from_file(tempdb.reopen().unwrap(), &commands), expected);
         }
     }
 
