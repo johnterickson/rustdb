@@ -49,7 +49,7 @@ fn null_term_str(bytes: &[u8]) -> &str {
 impl Display for Row {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.write_fmt(format_args!(
-            "[{} '{}' '{}']",
+            "[{:0>8} '{}' '{}']",
             self.id,
             null_term_str(&self.username),
             null_term_str(&self.email)
@@ -499,10 +499,13 @@ impl<'a> Cursor<'a> {
     ) -> TableResult<(bool, Cursor<'a>)> {
         match table.pager.get_page(page_num)?.unwrap().node {
             Node::Internal(ref internal) => {
-                let (_, child_number) = internal.find(key);
+                let (_, mut child_number) = internal.find(key);
+                if child_number == internal.child_count {
+                    child_number -= 1;
+                }
                 let child_cell = internal.children[child_number as usize].as_ref().unwrap();
                 let child_page_num = child_cell.child;
-                return Cursor::find_from_page(table, child_page_num, key);
+                Cursor::find_from_page(table, child_page_num, key)
             }
             Node::Leaf(ref leaf) => {
                 let (found, cell_number) = leaf.find(key);
@@ -513,9 +516,9 @@ impl<'a> Cursor<'a> {
                     end_of_table: false,
                 };
                 cursor.update_end_of_table()?;
-                return Ok((found, cursor));
+                Ok((found, cursor))
             }
-        };
+        }
     }
 
     /*
@@ -555,6 +558,13 @@ impl<'a> Cursor<'a> {
         })
     }
 
+    fn internal_node_mut(&mut self) -> TableResult<&mut InternalNode> {
+        Ok(match self.page()?.node {
+            Node::Internal(ref mut i) => i,
+            Node::Leaf(_) => unreachable!(),
+        })
+    }
+
     fn advance(&mut self) -> TableResult<()> {
         if self.end_of_table {
             return Ok(());
@@ -584,6 +594,8 @@ impl<'a> Cursor<'a> {
                         assert!(leaf.cells[cell_number].is_none());
                         leaf.cells[cell_number] = Some(cell);
                         leaf.cell_count += 1;
+                        self.table.row_count += 1;
+                        self.table.validate()?;
                         return Ok(());
                     }
                 }
@@ -645,41 +657,70 @@ impl<'a> Cursor<'a> {
             parent: None,
         })?;
 
-        let mut new_internal_node = InternalNode::create_empty();
-        new_internal_node.child_count = 2;
-        new_internal_node.children[0] = Some(InternalCell {
-            key: left_max,
-            child: self.page_index,
-        });
-        new_internal_node.children[1] = Some(InternalCell {
-            key: right_max,
-            child: right_page_num,
-        });
-        new_internal_node.right_child = Some(right_page_num);
-        let new_page = Page {
-            node: Node::Internal(new_internal_node),
-            parent: original_parent,
+        let parent_page_num = match original_parent {
+            Some(parent) => {
+                match self.table.pager.get_page(parent)?.as_mut().unwrap().node {
+                    Node::Leaf(_) => unreachable!(),
+                    Node::Internal(ref mut i) => {
+                        let search_result = i.children[0..i.child_count as usize].binary_search_by(|probe| probe.as_ref().unwrap().key.cmp(&right_max));
+                        let (found, child_num) = match search_result {
+                            Ok(i) => (true, i),
+                            Err(i) => (false, i),
+                        };
+
+                        //assert!(!found);
+                        if child_num != i.child_count as usize {
+                            i.children[child_num..i.child_count as usize].rotate_right(1);
+                        }
+                        i.children[child_num] = Some(InternalCell { key: right_max, child: right_page_num});
+                        i.child_count += 1;
+                    }
+                }
+
+                parent
+            },
+            None => {
+                let mut new_internal_node = InternalNode::create_empty();
+                new_internal_node.child_count = 2;
+                new_internal_node.children[0] = Some(InternalCell {
+                    key: left_max,
+                    child: self.page_index,
+                });
+                new_internal_node.children[1] = Some(InternalCell {
+                    key: right_max,
+                    child: right_page_num,
+                });
+                new_internal_node.right_child = Some(right_page_num);
+                let new_page = Page {
+                    node: Node::Internal(new_internal_node),
+                    parent: original_parent,
+                };
+                let (parent_page_num, _) = self.table.pager.alloc(new_page)?;
+                let left = self.table.pager.get_page(left_page_num)?.unwrap();
+                left.parent = Some(parent_page_num);
+
+                parent_page_num
+            } 
         };
 
-        // update parent and pointers
-        let (new_page_num, _) = self.table.pager.alloc(new_page)?;
-        {
-            let left = self.table.pager.get_page(left_page_num)?.unwrap();
-            left.parent = Some(new_page_num);
-            if let Node::Leaf(ref mut left) = left.node {
-                left.next_leaf = right_page_num;
-            } else {
-                assert!(false);
-            }
+        // update pointer
+        let left = self.table.pager.get_page(left_page_num)?.unwrap();
+        if let Node::Leaf(ref mut left) = left.node {
+            left.next_leaf = right_page_num;
+        } else {
+            assert!(false);
         }
-        self.table.pager.get_page(right_page_num)?.unwrap().parent = Some(new_page_num);
+
+        self.table.pager.get_page(right_page_num)?.unwrap().parent = Some(parent_page_num);
 
         // update next leaf pointer
 
         if self.table.root_page == left_page_num {
-            self.table.root_page = new_page_num;
+            self.table.root_page = parent_page_num;
         }
 
+        self.table.row_count += 1;
+        self.table.validate()?;
         Ok(())
     }
 }
@@ -712,12 +753,11 @@ impl Statement {
 struct Table {
     root_page: PageNumber,
     pager: Pager,
+    row_count: Id,
 }
 
 impl Table {
     fn new(mut pager: Pager) -> TableResult<Table> {
-        // todo: keeping root at page_num 0 would be good
-
         let mut root_page = None;
 
         let mut page_num = 0;
@@ -741,7 +781,17 @@ impl Table {
             }
         };
 
-        Ok(Table { root_page, pager })
+        let mut table = Table { root_page, pager, row_count: 0 };
+        let mut row_count = 0;
+        let mut cursor = Cursor::start(&mut table)?;
+        while !cursor.end_of_table {
+            cursor.advance()?;
+            row_count += 1;
+        }
+
+        table.row_count = row_count;
+
+        Ok(table)
     }
 
     fn exec<W: Write>(&mut self, s: &Statement, output: &mut W) -> TableResult<()> {
@@ -778,6 +828,51 @@ impl Table {
                 Ok(())
             }
         }
+    }
+
+    fn validate(&mut self) -> TableResult<()> {
+        let mut cursor = Cursor::start(self)?;
+        let mut rows_found = 0;
+        let mut last_key = None;
+        while !cursor.end_of_table {
+            rows_found += 1;
+
+            let this_key = cursor.cell()?.as_ref().unwrap().key;
+            assert!(last_key.is_none() || last_key.unwrap() < this_key);
+            last_key = Some(this_key);
+
+            match cursor.page()?.node {
+                Node::Leaf(ref lnode) => {
+                    let mut last_key = None;
+                    for i in 0..lnode.cell_count as usize {
+                        assert!(lnode.cells[i].is_some());
+                        let this_key = lnode.cells[i].as_ref().unwrap().key;
+                        assert!(last_key.is_none() || last_key.unwrap() < this_key);
+                        last_key = Some(this_key);
+                    }
+                    for i in lnode.cell_count as usize..LeafNode::MAX_CELLS {
+                        assert!(lnode.cells[i].is_none());
+                    }
+                },
+                Node::Internal(ref inode) => {
+                    for i in 0..inode.child_count as usize {
+                        assert!(inode.children[i].is_some());
+                        let this_key = inode.children[i].as_ref().unwrap().key;
+                        assert!(last_key.is_none() || last_key.unwrap() < this_key);
+                        last_key = Some(this_key);
+                    }
+                    for i in inode.child_count as usize..InternalNode::MAX_CELLS {
+                        assert!(inode.children[i].is_none());
+                    }
+                    assert_eq!(inode.right_child.unwrap(), inode.children[inode.child_count as usize - 1].as_ref().unwrap().child);
+                }
+            }
+
+            cursor.advance()?;
+        }
+
+        assert_eq!(self.row_count, rows_found);
+        Ok(())
     }
 }
 
@@ -869,7 +964,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+use super::*;
     use tempfile::tempfile;
 
     fn run_from_file<S: AsRef<str>>(file: File, input: &[S]) -> Vec<String> {
@@ -903,42 +998,21 @@ mod tests {
     fn echo() {
         assert_eq!(
             run(&["insert 11 john john@john.com", "select", ".exit"]),
-            [" [11 'john' 'john@john.com']", "1 rows.",]
+            [" [00000011 'john' 'john@john.com']", "1 rows.",]
         );
     }
 
-    #[test]
-    fn order() {
-        assert_eq!(
-            run(&[
-                "insert 11 john11 john11@john.com",
-                "insert 10 john10 john10@john.com",
-                "insert 12 john12 john12@john.com",
-                "insert 9 john9 john9@john.com",
-                "select",
-                ".exit"
-            ]),
-            [
-                " [9 'john9' 'john9@john.com']",
-                " [10 'john10' 'john10@john.com']",
-                " [11 'john11' 'john11@john.com']",
-                " [12 'john12' 'john12@john.com']",
-                "4 rows.",
-            ]
-        );
-    }
-
-    #[test]
-    fn split_leaf() {
+    fn persist_helper(keys: Vec<usize>) {
         let tempdb = tempfile::NamedTempFile::new().unwrap();
-        let inserts: Vec<_> = (0..=LeafNode::MAX_CELLS)
+        let inserts: Vec<_> = keys.iter()
             .map(|i| format!("insert {} john{} john{}@john.com", i, i, i))
             .collect();
         let expected = {
-            let mut expected: Vec<_> = (0..=LeafNode::MAX_CELLS)
-                .map(|i| format!(" [{} 'john{}' 'john{}@john.com']", i, i, i))
+            let mut expected: Vec<_> = keys.iter()
+                .map(|i| format!(" [{:0>8} 'john{}' 'john{}@john.com']", i, i, i))
                 .collect();
-            expected.push(format!("{} rows.", LeafNode::MAX_CELLS + 1));
+            expected.sort();
+            expected.push(format!("{} rows.", keys.len()));
             expected
         };
 
@@ -958,6 +1032,28 @@ mod tests {
     }
 
     #[test]
+    fn full_leaf() {
+        persist_helper((0..LeafNode::MAX_CELLS).collect());
+        persist_helper((0..LeafNode::MAX_CELLS).rev().collect());
+    }
+
+    #[test]
+    fn split_leaf() {
+        persist_helper((0..=LeafNode::MAX_CELLS).collect());
+        persist_helper((0..=LeafNode::MAX_CELLS).rev().collect());
+    }
+
+    #[test]
+    fn split_leaf_twice() {
+        persist_helper((0..(2*LeafNode::MAX_CELLS)).collect());
+    }
+
+    #[test]
+    fn split_leaf_twice_backwards() {
+        persist_helper((0..(2*LeafNode::MAX_CELLS)).rev().collect());
+    }
+
+    #[test]
     fn duplicate() {
         assert_eq!(
             run(&[
@@ -968,7 +1064,7 @@ mod tests {
             ]),
             [
                 "Error: IdAlreadyExists",
-                " [11 'john11' 'john11@john.com']",
+                " [00000011 'john11' 'john11@john.com']",
                 "1 rows.",
             ]
         );
@@ -976,17 +1072,6 @@ mod tests {
 
     #[test]
     fn persist() {
-        let tempdb = tempfile::NamedTempFile::new().unwrap();
-        assert_eq!(
-            run_from_file(
-                tempdb.reopen().unwrap(),
-                &["insert 11 john john@john.com", "select", ".exit"]
-            ),
-            [" [11 'john' 'john@john.com']", "1 rows.",]
-        );
-        assert_eq!(
-            run_from_file(tempdb.reopen().unwrap(), &["select", ".exit"]),
-            [" [11 'john' 'john@john.com']", "1 rows."]
-        );
+        persist_helper( (11..=11).collect());
     }
 }
