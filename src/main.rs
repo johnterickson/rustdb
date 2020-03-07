@@ -284,7 +284,7 @@ impl LeafNode {
         for _ in 0..cell_count {
             node.cells.push(LeafCell::deserialize(&mut reader)?);
         }
-        for _ in cell_count as usize ..LeafNode::MAX_CELLS {
+        for _ in cell_count as usize..LeafNode::MAX_CELLS {
             LeafCell::deserialize(&mut reader)?;
         }
         node.next_leaf = next_leaf;
@@ -311,12 +311,22 @@ impl Node {
 
     fn max_key(&self) -> Option<Id> {
         match self {
-            Node::Internal(internal) => Some(
-                internal.children.last().unwrap().key
-            ),
-            Node::Leaf(leaf) => {
-                leaf.cells.last().map(|cell| cell.key)
-            }
+            Node::Internal(internal) => Some(internal.children.last().unwrap().key),
+            Node::Leaf(leaf) => leaf.cells.last().map(|cell| cell.key),
+        }
+    }
+
+    fn as_internal(&self) -> &InternalNode {
+        match self {
+            Node::Internal(ref i) => i,
+            _ => panic!("Not an internal node."),
+        }
+    }
+
+    fn as_leaf(&self) -> &LeafNode {
+        match self {
+            Node::Leaf(ref leaf) => leaf,
+            _ => panic!("Not a leaf node."),
         }
     }
 }
@@ -381,7 +391,7 @@ struct Pager {
 }
 
 impl Pager {
-    const MAX_PAGES: PageNumber = 100;
+    const MAX_PAGES: PageNumber = 1000;
 
     fn from_file(file: File) -> TableResult<Pager> {
         let file_length = file.metadata()?.len();
@@ -408,9 +418,17 @@ impl Pager {
         Pager::from_file(file)
     }
 
+    fn assert_pages_available(&self, pages_needed: PageNumber) -> TableResult<()> {
+        if self.page_count + pages_needed <= Pager::MAX_PAGES {
+            Ok(())
+        } else {
+            Err(TableError::TableFull)
+        }
+    }
+
     fn alloc(&mut self, p: Page) -> TableResult<(PageNumber, &mut Page)> {
         let page_num = self.page_count;
-        if page_num == Pager::MAX_PAGES {
+        if page_num >= Pager::MAX_PAGES {
             return Err(TableError::TableFull);
         }
 
@@ -427,13 +445,13 @@ impl Pager {
 
     fn get_page(&mut self, page_num: PageNumber) -> TableResult<Option<&mut Page>> {
         if page_num >= Pager::MAX_PAGES {
-            return Ok(None);
+            return Err(TableError::TableFull);
         }
 
-        let page = self.pages.get_mut(page_num as usize);
+        let page_slot = self.pages.get_mut(page_num as usize);
 
-        if let Some(page) = page {
-            if let Some(page) = page {
+        if let Some(page_slot) = page_slot {
+            if let Some(page) = page_slot {
                 Ok(Some(page))
             } else {
                 let file_offset = (PAGE_SIZE as u64) * (page_num as u64);
@@ -442,8 +460,8 @@ impl Pager {
                 // read in an existing page
                 self.file.seek(SeekFrom::Start(file_offset))?;
                 let faulted_page = Page::deserialize(&mut self.file)?;
-                *page = Some(Box::new(faulted_page));
-                Ok(Some(page.as_mut().unwrap()))
+                *page_slot = Some(Box::new(faulted_page));
+                Ok(Some(page_slot.as_mut().unwrap()))
             }
         } else {
             Ok(None)
@@ -584,6 +602,18 @@ impl<'a> Cursor<'a> {
             };
         }
 
+        // we'll need to allocate some pages - let's see if we have room...
+        let mut pages_needed = 1; // for a new leaf.
+        let original_parent = self.page()?.parent;
+        if let Some(original_parent) = original_parent {
+            let parent_page = self.table.pager.get_page(original_parent)?.unwrap();
+            assert!(parent_page.node.as_internal().children.len() < InternalNode::MAX_CELLS, "can't split internal node yet.");
+        } else {
+            // no parent, so we'll have to make one
+            pages_needed += 1;
+        }
+        self.table.pager.assert_pages_available(pages_needed)?;
+
         // we'll need to split the node
         // first, move the top half of cells to a new "right" node
         let mut right = LeafNode::create_empty();
@@ -610,7 +640,6 @@ impl<'a> Cursor<'a> {
 
         // next, we want to create a new parent that will point to this node and to new right node
 
-        let original_parent = self.page()?.parent;
         let leaf_max = self.page()?.node.max_key().unwrap();
         let right = Node::Leaf(right);
         let right_max = right.max_key().unwrap();
@@ -626,23 +655,33 @@ impl<'a> Cursor<'a> {
                 match self.table.pager.get_page(parent)?.as_mut().unwrap().node {
                     Node::Leaf(_) => unreachable!(),
                     Node::Internal(ref mut i) => {
-
-                        if let Ok(left_child) = i.children.binary_search_by(|cell| cell.key.cmp(&orig_leaf_max)) {
+                        if let Ok(left_child) = i
+                            .children
+                            .binary_search_by(|cell| cell.key.cmp(&orig_leaf_max))
+                        {
                             i.children[left_child].key = leaf_max;
                         }
 
-                        let search_result = i.children.binary_search_by(|probe| probe.key.cmp(&right_max));
+                        let search_result = i
+                            .children
+                            .binary_search_by(|probe| probe.key.cmp(&right_max));
                         let (_found, child_num) = match search_result {
                             Ok(i) => (true, i),
                             Err(i) => (false, i),
                         };
 
-                        i.children.insert(child_num, InternalCell { key: right_max, child: right_page_num});
+                        i.children.insert(
+                            child_num,
+                            InternalCell {
+                                key: right_max,
+                                child: right_page_num,
+                            },
+                        );
                     }
                 }
 
                 parent
-            },
+            }
             None => {
                 let mut new_internal_node = InternalNode::create_empty();
                 new_internal_node.children.push(InternalCell {
@@ -663,7 +702,7 @@ impl<'a> Cursor<'a> {
                 left.parent = Some(parent_page_num);
 
                 parent_page_num
-            } 
+            }
         };
 
         // update pointer
@@ -744,7 +783,11 @@ impl Table {
             }
         };
 
-        let mut table = Table { root_page, pager, row_count: 0 };
+        let mut table = Table {
+            root_page,
+            pager,
+            row_count: 0,
+        };
         let mut row_count = 0;
         let mut cursor = Cursor::start(&mut table)?;
         while !cursor.end_of_table {
@@ -811,14 +854,17 @@ impl Table {
                         assert!(last_key.is_none() || last_key.unwrap() < cell.key);
                         last_key = Some(cell.key);
                     }
-                },
+                }
                 Node::Internal(ref inode) => {
                     let mut last_key = None;
                     for child in &inode.children {
                         assert!(last_key.is_none() || last_key.unwrap() < child.key);
                         last_key = Some(child.key);
                     }
-                    assert_eq!(inode.right_child.unwrap(), inode.children.last().unwrap().child);
+                    assert_eq!(
+                        inode.right_child.unwrap(),
+                        inode.children.last().unwrap().child
+                    );
                 }
             }
 
@@ -845,7 +891,7 @@ impl<R: BufRead, W: Write> Repl<R, W> {
         })
     }
 
-    fn run(&mut self) -> TableResult<i32> {
+    fn run(&mut self, bail_on_fail: bool) -> TableResult<i32> {
         loop {
             write!(&mut self.output, "db > ")?;
             self.output.flush()?;
@@ -874,6 +920,11 @@ impl<R: BufRead, W: Write> Repl<R, W> {
                                         "LeafNode::MAX_CELLS: {}",
                                         &LeafNode::MAX_CELLS
                                     )?;
+                                    writeln!(
+                                        &mut self.output,
+                                        "InternalNode::MAX_CELLS: {}",
+                                        &InternalNode::MAX_CELLS
+                                    )?;
                                 }
                                 ".exit" => return Ok(0),
                                 _ => {
@@ -884,6 +935,9 @@ impl<R: BufRead, W: Write> Repl<R, W> {
                             if let Some(stmt) = Statement::parse(&line) {
                                 if let Err(e) = self.table.exec(&stmt, &mut self.output) {
                                     writeln!(&mut self.output, "Error: {:?}", &e)?;
+                                    if bail_on_fail {
+                                        return Err(e);
+                                    }
                                 }
                             }
                         }
@@ -903,7 +957,7 @@ fn real_main() -> TableResult<i32> {
 
     let pager = Pager::open("db.bin")?;
     let mut repl = Repl::new(stdin.lock(), stdout, pager)?;
-    repl.run()
+    repl.run(false)
 }
 
 fn main() {
@@ -918,10 +972,11 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-use super::*;
+    use super::*;
+    use rand::prelude::*;
     use tempfile::tempfile;
 
-    fn run_from_file<S: AsRef<str>>(file: File, input: &[S]) -> Vec<String> {
+    fn run_from_file<S: AsRef<str>>(file: File, input: &[S]) -> TableResult<Vec<String>> {
         let pager = Pager::from_file(file).unwrap();
         let mut input_bytes = Vec::new();
         for line in input {
@@ -929,40 +984,42 @@ use super::*;
             input_bytes.push('\n' as u8);
         }
         let mut output = Vec::new();
-        let mut repl = Repl::new(&input_bytes[..], &mut output, pager).unwrap();
-        repl.run().unwrap();
+        let mut repl = Repl::new(&input_bytes[..], &mut output, pager)?;
+        repl.run(true)?;
         let output = String::from_utf8(output).unwrap();
-        output
+        Ok(output
             .lines()
             .filter(|line| line != &"db > ")
             .map(|line| line.to_owned())
-            .collect()
+            .collect())
     }
 
-    fn run<S: AsRef<str>>(input: &[S]) -> Vec<String> {
+    fn run<S: AsRef<str>>(input: &[S]) -> TableResult<Vec<String>> {
         run_from_file(tempfile().unwrap(), input)
     }
 
     #[test]
     fn empty() {
-        assert_eq!(run(&["select", ".exit"]), ["0 rows."]);
+        assert_eq!(run(&["select", ".exit"]).unwrap(), ["0 rows."]);
     }
 
     #[test]
     fn echo() {
         assert_eq!(
-            run(&["insert 11 john john@john.com", "select", ".exit"]),
+            run(&["insert 11 john john@john.com", "select", ".exit"]).unwrap(),
             [" [00000011 'john' 'john@john.com']", "1 rows.",]
         );
     }
 
     fn persist_helper(keys: Vec<usize>) {
         let tempdb = tempfile::NamedTempFile::new().unwrap();
-        let inserts: Vec<_> = keys.iter()
+        let inserts: Vec<_> = keys
+            .iter()
             .map(|i| format!("insert {} john{} john{}@john.com", i, i, i))
             .collect();
         let expected = {
-            let mut expected: Vec<_> = keys.iter()
+            let mut expected: Vec<_> = keys
+                .iter()
                 .map(|i| format!(" [{:0>8} 'john{}' 'john{}@john.com']", i, i, i))
                 .collect();
             expected.sort();
@@ -974,14 +1031,14 @@ use super::*;
             let mut commands = inserts.clone();
             commands.push("select".to_owned());
             commands.push(".exit".to_owned());
-            assert_eq!(run_from_file(tempdb.reopen().unwrap(), &commands), expected);
+            assert_eq!(run_from_file(tempdb.reopen().unwrap(), &commands).unwrap(), expected);
         }
 
         {
             let mut commands = Vec::new();
             commands.push("select".to_owned());
             commands.push(".exit".to_owned());
-            assert_eq!(run_from_file(tempdb.reopen().unwrap(), &commands), expected);
+            assert_eq!(run_from_file(tempdb.reopen().unwrap(), &commands).unwrap(), expected);
         }
     }
 
@@ -999,33 +1056,33 @@ use super::*;
 
     #[test]
     fn split_leaf_twice() {
-        persist_helper((0..(2*LeafNode::MAX_CELLS)).collect());
+        persist_helper((0..(2 * LeafNode::MAX_CELLS)).collect());
+        persist_helper((0..(2 * LeafNode::MAX_CELLS)).rev().collect());
     }
 
     #[test]
-    fn split_leaf_twice_backwards() {
-        persist_helper((0..(2*LeafNode::MAX_CELLS)).rev().collect());
+    fn fill_first_level() {
+        let max = InternalNode::MAX_CELLS / 2 * LeafNode::MAX_CELLS;
+        persist_helper((0..max).collect());
+        persist_helper((0..max).rev().collect());
     }
 
     #[test]
     fn duplicate() {
-        assert_eq!(
-            run(&[
+        assert!(match  run(&[
                 "insert 11 john11 john11@john.com",
                 "insert 11 john11 john11@john.com",
                 "select",
                 ".exit"
-            ]),
-            [
-                "Error: IdAlreadyExists",
-                " [00000011 'john11' 'john11@john.com']",
-                "1 rows.",
-            ]
+            ]) {
+                Err(TableError::IdAlreadyExists) => true,
+                _ => false
+            }
         );
     }
 
     #[test]
     fn persist() {
-        persist_helper( (11..=11).collect());
+        persist_helper((11..=11).collect());
     }
 }

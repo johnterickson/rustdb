@@ -30,6 +30,7 @@ dependencies = [
 name = "jdb"
 version = "0.1.0"
 dependencies = [
+ "rand",
  "static_assertions",
  "tempfile",
 ]
