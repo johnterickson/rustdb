@@ -391,8 +391,6 @@ struct Pager {
 }
 
 impl Pager {
-    const MAX_PAGES: PageNumber = 1000;
-
     fn from_file(file: File) -> TableResult<Pager> {
         let file_length = file.metadata()?.len();
         assert!(file_length % PAGE_SIZE as u64 == 0);
@@ -418,19 +416,8 @@ impl Pager {
         Pager::from_file(file)
     }
 
-    fn assert_pages_available(&self, pages_needed: PageNumber) -> TableResult<()> {
-        if self.page_count + pages_needed <= Pager::MAX_PAGES {
-            Ok(())
-        } else {
-            Err(TableError::TableFull)
-        }
-    }
-
     fn alloc(&mut self, p: Page) -> TableResult<(PageNumber, &mut Page)> {
         let page_num = self.page_count;
-        if page_num >= Pager::MAX_PAGES {
-            return Err(TableError::TableFull);
-        }
 
         let file_offset = (PAGE_SIZE as u64) * (page_num as u64);
         assert!(file_offset == self.file_length);
@@ -444,10 +431,6 @@ impl Pager {
     }
 
     fn get_page(&mut self, page_num: PageNumber) -> TableResult<Option<&mut Page>> {
-        if page_num >= Pager::MAX_PAGES {
-            return Err(TableError::TableFull);
-        }
-
         let page_slot = self.pages.get_mut(page_num as usize);
 
         if let Some(page_slot) = page_slot {
@@ -603,16 +586,11 @@ impl<'a> Cursor<'a> {
         }
 
         // we'll need to allocate some pages - let's see if we have room...
-        let mut pages_needed = 1; // for a new leaf.
         let original_parent = self.page()?.parent;
         if let Some(original_parent) = original_parent {
             let parent_page = self.table.pager.get_page(original_parent)?.unwrap();
             assert!(parent_page.node.as_internal().children.len() < InternalNode::MAX_CELLS, "can't split internal node yet.");
-        } else {
-            // no parent, so we'll have to make one
-            pages_needed += 1;
         }
-        self.table.pager.assert_pages_available(pages_needed)?;
 
         // we'll need to split the node
         // first, move the top half of cells to a new "right" node
