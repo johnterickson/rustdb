@@ -19,7 +19,7 @@ const PAGE_SIZE: usize = 4096;
 enum TableError {
     Io(io::Error),
     IdAlreadyExists,
-    TableFull,
+    CannotSplitInternalNodes,
     RootPageNotFound,
 }
 
@@ -589,7 +589,9 @@ impl<'a> Cursor<'a> {
         let original_parent = self.page()?.parent;
         if let Some(original_parent) = original_parent {
             let parent_page = self.table.pager.get_page(original_parent)?.unwrap();
-            assert!(parent_page.node.as_internal().children.len() < InternalNode::MAX_CELLS, "can't split internal node yet.");
+            if parent_page.node.as_internal().children.len() == InternalNode::MAX_CELLS {
+                return Err(TableError::CannotSplitInternalNodes);
+            }
         }
 
         // we'll need to split the node
@@ -951,7 +953,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::prelude::*;
+    use rand::{Rng, SeedableRng};
+    use std::collections::BTreeSet;
     use tempfile::tempfile;
 
     fn run_from_file<S: AsRef<str>>(file: File, input: &[S]) -> TableResult<Vec<String>> {
@@ -989,7 +992,7 @@ mod tests {
         );
     }
 
-    fn persist_helper(keys: Vec<usize>) {
+    fn persist_helper(keys: &[Id]) -> TableResult<()> {
         let tempdb = tempfile::NamedTempFile::new().unwrap();
         let inserts: Vec<_> = keys
             .iter()
@@ -1009,58 +1012,98 @@ mod tests {
             let mut commands = inserts.clone();
             commands.push("select".to_owned());
             commands.push(".exit".to_owned());
-            assert_eq!(run_from_file(tempdb.reopen().unwrap(), &commands).unwrap(), expected);
+            assert_eq!(
+                run_from_file(tempdb.reopen().unwrap(), &commands)?,
+                expected
+            );
         }
 
         {
             let mut commands = Vec::new();
             commands.push("select".to_owned());
             commands.push(".exit".to_owned());
-            assert_eq!(run_from_file(tempdb.reopen().unwrap(), &commands).unwrap(), expected);
+            assert_eq!(
+                run_from_file(tempdb.reopen().unwrap(), &commands)?,
+                expected
+            );
         }
+
+        Ok(())
+    }
+
+    fn persist_both_directions(max: Id) {
+        let keys: Vec<Id> = (0..max).collect();
+        persist_helper(&keys).unwrap();
+        let keys: Vec<Id> = keys.iter().rev().cloned().collect();
+        persist_helper(&keys).unwrap();
     }
 
     #[test]
     fn full_leaf() {
-        persist_helper((0..LeafNode::MAX_CELLS).collect());
-        persist_helper((0..LeafNode::MAX_CELLS).rev().collect());
+        persist_both_directions(LeafNode::MAX_CELLS as Id);
     }
 
     #[test]
     fn split_leaf() {
-        persist_helper((0..=LeafNode::MAX_CELLS).collect());
-        persist_helper((0..=LeafNode::MAX_CELLS).rev().collect());
+        persist_both_directions((LeafNode::MAX_CELLS + 1) as Id);
     }
 
     #[test]
     fn split_leaf_twice() {
-        persist_helper((0..(2 * LeafNode::MAX_CELLS)).collect());
-        persist_helper((0..(2 * LeafNode::MAX_CELLS)).rev().collect());
+        persist_both_directions((2 * LeafNode::MAX_CELLS + 1) as Id);
+    }
+
+    #[test]
+    fn split_leaves_a_bunch() {
+        persist_both_directions(5 * LeafNode::MAX_CELLS as Id);
+    }
+
+    #[test]
+    fn split_leaves_a_bunch_randomly() {
+        let key_count = 5 * LeafNode::MAX_CELLS;
+        let mut keys: BTreeSet<Id> = BTreeSet::new();
+
+        let seed = [0u8; 32];
+        let mut rng = rand::rngs::StdRng::from_seed(seed);
+        for _ in 0..key_count {
+            let key: Id = rng.gen();
+            keys.insert(key % 100000000);
+        }
+        let keys: Vec<_> = keys.iter().cloned().collect();
+        persist_helper(&keys).unwrap();
     }
 
     #[test]
     fn fill_first_level() {
-        let max = InternalNode::MAX_CELLS / 2 * LeafNode::MAX_CELLS;
-        persist_helper((0..max).collect());
-        persist_helper((0..max).rev().collect());
+        let max = InternalNode::MAX_CELLS * LeafNode::MAX_CELLS;
+        let keys: Vec<Id> = (0..max as Id).collect();
+        assert!(match persist_helper(&keys) {
+            Err(TableError::CannotSplitInternalNodes) => true,
+            _ => false,
+        });
+        let keys: Vec<Id> = keys.iter().rev().cloned().collect();
+        assert!(match persist_helper(&keys) {
+            Err(TableError::CannotSplitInternalNodes) => true,
+            _ => false,
+        });
     }
 
     #[test]
     fn duplicate() {
-        assert!(match  run(&[
-                "insert 11 john11 john11@john.com",
-                "insert 11 john11 john11@john.com",
-                "select",
-                ".exit"
-            ]) {
-                Err(TableError::IdAlreadyExists) => true,
-                _ => false
-            }
-        );
+        assert!(match run(&[
+            "insert 11 john11 john11@john.com",
+            "insert 11 john11 john11@john.com",
+            "select",
+            ".exit"
+        ]) {
+            Err(TableError::IdAlreadyExists) => true,
+            _ => false,
+        });
     }
 
     #[test]
     fn persist() {
-        persist_helper((11..=11).collect());
+        let keys: Vec<Id> = (1..=11).collect();
+        persist_helper(&keys).unwrap();
     }
 }
