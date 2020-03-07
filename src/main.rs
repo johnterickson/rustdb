@@ -159,8 +159,7 @@ impl InternalCell {
 const_assert!(size_of::<InternalCell>() == size_of::<Id>() + size_of::<PageNumber>());
 
 struct InternalNode {
-    children: [Option<InternalCell>; InternalNode::MAX_CELLS],
-    child_count: u32,
+    children: Vec<InternalCell>,
     right_child: Option<PageNumber>,
 }
 
@@ -173,15 +172,14 @@ impl InternalNode {
 
     fn create_empty() -> InternalNode {
         InternalNode {
-            children: array![None; InternalNode::MAX_CELLS],
-            child_count: 0,
+            children: Vec::with_capacity(InternalNode::MAX_CELLS),
             right_child: None,
         }
     }
 
     fn find(&self, key: Id) -> (bool, CellNumber) {
-        let cells = &self.children[0..self.child_count as usize];
-        let search_result = cells.binary_search_by(|probe| probe.as_ref().unwrap().key.cmp(&key));
+        let cells = &self.children;
+        let search_result = cells.binary_search_by(|probe| probe.key.cmp(&key));
         match search_result {
             Ok(found) => (true, found as CellNumber),
             Err(insert_here) => (false, insert_here as CellNumber),
@@ -190,14 +188,15 @@ impl InternalNode {
 
     fn serialize<W: Write>(&self, mut writer: W) -> TableResult<()> {
         let mut child_count = [0u8; size_of::<u32>()];
-        child_count[0..4].copy_from_slice(&self.child_count.to_le_bytes());
+        child_count[0..4].copy_from_slice(&(self.children.len() as u32).to_le_bytes());
         writer.write_all(&child_count)?;
 
         for child in self.children.iter() {
-            child
-                .as_ref()
-                .unwrap_or(&InternalCell::default())
-                .serialize(&mut writer)?;
+            child.serialize(&mut writer)?;
+        }
+
+        for _ in self.children.len()..InternalNode::MAX_CELLS {
+            InternalCell::default().serialize(&mut writer)?
         }
 
         writer.write_all(&[0u8; InternalNode::WASTED_SPACE])?;
@@ -211,9 +210,12 @@ impl InternalNode {
 
         let mut node = InternalNode::create_empty();
         for i in 0..child_count {
-            node.children[i as usize] = Some(InternalCell::deserialize(&mut reader)?);
+            node.children.push(InternalCell::deserialize(&mut reader)?);
         }
-        node.child_count = child_count;
+
+        for _ in child_count as usize..InternalNode::MAX_CELLS {
+            InternalCell::deserialize(&mut reader)?;
+        }
 
         let mut padding = [0u8; InternalNode::WASTED_SPACE];
         reader.read_exact(&mut padding)?;
@@ -223,8 +225,7 @@ impl InternalNode {
 }
 
 struct LeafNode {
-    cells: [Option<LeafCell>; LeafNode::MAX_CELLS],
-    cell_count: u32,
+    cells: Vec<LeafCell>,
     next_leaf: PageNumber,
 }
 
@@ -238,15 +239,13 @@ impl LeafNode {
 
     fn create_empty() -> LeafNode {
         LeafNode {
-            cells: array![None; LeafNode::MAX_CELLS],
-            cell_count: 0,
+            cells: Vec::with_capacity(LeafNode::MAX_CELLS),
             next_leaf: 0,
         }
     }
 
     fn find(&self, key: Id) -> (bool, CellNumber) {
-        let cells = &self.cells[0..self.cell_count as usize];
-        let search_result = cells.binary_search_by(|probe| probe.as_ref().unwrap().key.cmp(&key));
+        let search_result = self.cells.binary_search_by(|probe| probe.key.cmp(&key));
         match search_result {
             Ok(found) => (true, found as CellNumber),
             Err(insert_here) => (false, insert_here as CellNumber),
@@ -255,7 +254,7 @@ impl LeafNode {
 
     fn serialize<W: Write>(&self, mut writer: W) -> TableResult<()> {
         let mut cell_count = [0u8; size_of::<u32>()];
-        cell_count[0..4].copy_from_slice(&self.cell_count.to_le_bytes());
+        cell_count[0..4].copy_from_slice(&(self.cells.len() as u32).to_le_bytes());
         writer.write_all(&cell_count)?;
 
         let mut next_leaf = [0u8; size_of::<u32>()];
@@ -263,9 +262,11 @@ impl LeafNode {
         writer.write_all(&next_leaf)?;
 
         for cell in &self.cells {
-            cell.as_ref()
-                .unwrap_or(&LeafCell::default())
-                .serialize(&mut writer)?;
+            cell.serialize(&mut writer)?;
+        }
+
+        for _ in self.cells.len()..LeafNode::MAX_CELLS {
+            LeafCell::default().serialize(&mut writer)?
         }
 
         writer.write_all(&[0u8; LeafNode::WASTED_SPACE])?;
@@ -283,9 +284,11 @@ impl LeafNode {
 
         let mut node = LeafNode::create_empty();
         for i in 0..cell_count {
-            node.cells[i as usize] = Some(LeafCell::deserialize(&mut reader)?);
+            node.cells.push(LeafCell::deserialize(&mut reader)?);
         }
-        node.cell_count = cell_count;
+        for _ in cell_count as usize ..LeafNode::MAX_CELLS {
+            LeafCell::deserialize(&mut reader)?;
+        }
         node.next_leaf = next_leaf;
 
         let mut padding = [0u8; LeafNode::WASTED_SPACE];
@@ -311,22 +314,10 @@ impl Node {
     fn max_key(&self) -> Option<Id> {
         match self {
             Node::Internal(internal) => Some(
-                internal.children[internal.child_count as usize - 1]
-                    .as_ref()
-                    .unwrap()
-                    .key,
+                internal.children.last().unwrap().key
             ),
             Node::Leaf(leaf) => {
-                if leaf.cell_count == 0 {
-                    None
-                } else {
-                    Some(
-                        leaf.cells[leaf.cell_count as usize - 1]
-                            .as_ref()
-                            .unwrap()
-                            .key,
-                    )
-                }
+                leaf.cells.last().map(|cell| cell.key)
             }
         }
     }
@@ -500,10 +491,10 @@ impl<'a> Cursor<'a> {
         match table.pager.get_page(page_num)?.unwrap().node {
             Node::Internal(ref internal) => {
                 let (_, mut child_number) = internal.find(key);
-                if child_number == internal.child_count {
+                if child_number as usize == internal.children.len() {
                     child_number -= 1;
                 }
-                let child_cell = internal.children[child_number as usize].as_ref().unwrap();
+                let child_cell = internal.children.get(child_number as usize).unwrap();
                 let child_page_num = child_cell.child;
                 Cursor::find_from_page(table, child_page_num, key)
             }
@@ -534,11 +525,11 @@ impl<'a> Cursor<'a> {
         Ok(self.table.pager.get_page(self.page_index)?.unwrap())
     }
 
-    fn cell(&mut self) -> TableResult<&mut Option<LeafCell>> {
+    fn cell(&mut self) -> TableResult<Option<&mut LeafCell>> {
         let cell_number = self.cell_number;
         Ok(match self.page()?.node {
             Node::Internal(_) => unimplemented!(),
-            Node::Leaf(ref mut leaf) => &mut leaf.cells[cell_number as usize],
+            Node::Leaf(ref mut leaf) => leaf.cells.get_mut(cell_number as usize),
         })
     }
 
@@ -546,7 +537,7 @@ impl<'a> Cursor<'a> {
         let cell_number = self.cell_number;
         self.end_of_table = match self.page()?.node {
             Node::Internal(_) => unreachable!(),
-            Node::Leaf(ref leaf) => cell_number >= leaf.cell_count,
+            Node::Leaf(ref leaf) => cell_number as usize >= leaf.cells.len(),
         };
         Ok(())
     }
@@ -571,7 +562,7 @@ impl<'a> Cursor<'a> {
         }
 
         self.cell_number += 1;
-        if self.cell_number < self.leaf_node()?.cell_count {
+        if (self.cell_number as usize) < self.leaf_node()?.cells.len() {
             return Ok(());
         }
 
@@ -589,11 +580,8 @@ impl<'a> Cursor<'a> {
         {
             match self.page()?.node {
                 Node::Leaf(ref mut leaf) => {
-                    if leaf.cell_count < LeafNode::MAX_CELLS as u32 {
-                        leaf.cells[cell_number..=leaf.cell_count as usize].rotate_right(1);
-                        assert!(leaf.cells[cell_number].is_none());
-                        leaf.cells[cell_number] = Some(cell);
-                        leaf.cell_count += 1;
+                    if leaf.cells.len() < LeafNode::MAX_CELLS {
+                        leaf.cells.insert(cell_number, cell);
                         self.table.row_count += 1;
                         self.table.validate()?;
                         return Ok(());
@@ -606,39 +594,22 @@ impl<'a> Cursor<'a> {
         // we'll need to split the node
         // first, move the top half of cells to a new "right" node
         let mut right = LeafNode::create_empty();
-        let mut cell = Some(cell);
+        let orig_leaf_max = self.page()?.node.max_key().unwrap();
         {
             match self.page()?.node {
                 Node::Leaf(ref mut leaf) => {
                     right.next_leaf = leaf.next_leaf;
 
-                    for i in (0..=LeafNode::MAX_CELLS).rev() {
-                        let dst_index = i % LeafNode::LEFT_SPLIT_COUNT;
-                        if i >= LeafNode::LEFT_SPLIT_COUNT {
-                            // goes in the right side
-                            if i == cell_number as usize {
-                                right.cells[dst_index] = Some(cell.take().unwrap());
-                            } else if i > cell_number as usize {
-                                right.cells[dst_index] =
-                                    std::mem::replace(&mut leaf.cells[i - 1], None);
-                            } else {
-                                right.cells[dst_index] =
-                                    std::mem::replace(&mut leaf.cells[i], None);
-                            }
-                        } else {
-                            // goes stays in the left side
-                            if i == cell_number as usize {
-                                leaf.cells[dst_index] = Some(cell.take().unwrap());
-                            } else if i > cell_number as usize {
-                                leaf.cells[dst_index] =
-                                    std::mem::replace(&mut leaf.cells[i - 1], None);
-                            } else {
-                                leaf.cells[dst_index] = std::mem::replace(&mut leaf.cells[i], None);
-                            }
-                        }
+                    right.cells = leaf.cells.split_off(LeafNode::LEFT_SPLIT_COUNT);
+                    if cell_number < LeafNode::LEFT_SPLIT_COUNT {
+                        right.cells.insert(0, leaf.cells.pop().unwrap());
+                        leaf.cells.insert(cell_number, cell);
+                    } else {
+                        let cell_number = cell_number - LeafNode::LEFT_SPLIT_COUNT;
+                        right.cells.insert(cell_number, cell);
                     }
-                    leaf.cell_count = LeafNode::LEFT_SPLIT_COUNT as u32;
-                    right.cell_count = LeafNode::RIGHT_SPLIT_COUNT as u32;
+                    assert_eq!(leaf.cells.len(), LeafNode::LEFT_SPLIT_COUNT);
+                    assert_eq!(right.cells.len(), LeafNode::RIGHT_SPLIT_COUNT);
                 }
                 Node::Internal(_) => unimplemented!(),
             }
@@ -647,7 +618,7 @@ impl<'a> Cursor<'a> {
         // next, we want to create a new parent that will point to this node and to new right node
 
         let original_parent = self.page()?.parent;
-        let left_max = self.page()?.node.max_key().unwrap();
+        let leaf_max = self.page()?.node.max_key().unwrap();
         let right = Node::Leaf(right);
         let right_max = right.max_key().unwrap();
 
@@ -662,18 +633,18 @@ impl<'a> Cursor<'a> {
                 match self.table.pager.get_page(parent)?.as_mut().unwrap().node {
                     Node::Leaf(_) => unreachable!(),
                     Node::Internal(ref mut i) => {
-                        let search_result = i.children[0..i.child_count as usize].binary_search_by(|probe| probe.as_ref().unwrap().key.cmp(&right_max));
-                        let (found, child_num) = match search_result {
+
+                        if let Ok(left_child) = i.children.binary_search_by(|cell| cell.key.cmp(&orig_leaf_max)) {
+                            i.children[left_child].key = leaf_max;
+                        }
+
+                        let search_result = i.children.binary_search_by(|probe| probe.key.cmp(&right_max));
+                        let (_found, child_num) = match search_result {
                             Ok(i) => (true, i),
                             Err(i) => (false, i),
                         };
 
-                        //assert!(!found);
-                        if child_num != i.child_count as usize {
-                            i.children[child_num..i.child_count as usize].rotate_right(1);
-                        }
-                        i.children[child_num] = Some(InternalCell { key: right_max, child: right_page_num});
-                        i.child_count += 1;
+                        i.children.insert(child_num, InternalCell { key: right_max, child: right_page_num});
                     }
                 }
 
@@ -681,12 +652,11 @@ impl<'a> Cursor<'a> {
             },
             None => {
                 let mut new_internal_node = InternalNode::create_empty();
-                new_internal_node.child_count = 2;
-                new_internal_node.children[0] = Some(InternalCell {
-                    key: left_max,
+                new_internal_node.children.push(InternalCell {
+                    key: leaf_max,
                     child: self.page_index,
                 });
-                new_internal_node.children[1] = Some(InternalCell {
+                new_internal_node.children.push(InternalCell {
                     key: right_max,
                     child: right_page_num,
                 });
@@ -844,27 +814,18 @@ impl Table {
             match cursor.page()?.node {
                 Node::Leaf(ref lnode) => {
                     let mut last_key = None;
-                    for i in 0..lnode.cell_count as usize {
-                        assert!(lnode.cells[i].is_some());
-                        let this_key = lnode.cells[i].as_ref().unwrap().key;
-                        assert!(last_key.is_none() || last_key.unwrap() < this_key);
-                        last_key = Some(this_key);
-                    }
-                    for i in lnode.cell_count as usize..LeafNode::MAX_CELLS {
-                        assert!(lnode.cells[i].is_none());
+                    for cell in &lnode.cells {
+                        assert!(last_key.is_none() || last_key.unwrap() < cell.key);
+                        last_key = Some(cell.key);
                     }
                 },
                 Node::Internal(ref inode) => {
-                    for i in 0..inode.child_count as usize {
-                        assert!(inode.children[i].is_some());
-                        let this_key = inode.children[i].as_ref().unwrap().key;
-                        assert!(last_key.is_none() || last_key.unwrap() < this_key);
-                        last_key = Some(this_key);
+                    let mut last_key = None;
+                    for child in &inode.children {
+                        assert!(last_key.is_none() || last_key.unwrap() < child.key);
+                        last_key = Some(child.key);
                     }
-                    for i in inode.child_count as usize..InternalNode::MAX_CELLS {
-                        assert!(inode.children[i].is_none());
-                    }
-                    assert_eq!(inode.right_child.unwrap(), inode.children[inode.child_count as usize - 1].as_ref().unwrap().child);
+                    assert_eq!(inode.right_child.unwrap(), inode.children.last().unwrap().child);
                 }
             }
 
