@@ -8,5 +8,4 @@ edition = "2018"
 
 [dependencies]
 static_assertions = "*"
-array-macro = "1.0.4"
 tempfile = "3"

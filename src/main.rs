@@ -1,6 +1,4 @@
 #[macro_use]
-extern crate array_macro;
-#[macro_use]
 extern crate static_assertions;
 
 use std::fmt::{Display, Formatter};
@@ -209,7 +207,7 @@ impl InternalNode {
         let child_count = u32::from_le_bytes(child_count);
 
         let mut node = InternalNode::create_empty();
-        for i in 0..child_count {
+        for _ in 0..child_count {
             node.children.push(InternalCell::deserialize(&mut reader)?);
         }
 
@@ -283,7 +281,7 @@ impl LeafNode {
         let next_leaf = u32::from_le_bytes(next_leaf);
 
         let mut node = LeafNode::create_empty();
-        for i in 0..cell_count {
+        for _ in 0..cell_count {
             node.cells.push(LeafCell::deserialize(&mut reader)?);
         }
         for _ in cell_count as usize ..LeafNode::MAX_CELLS {
@@ -377,7 +375,7 @@ impl Page {
 
 struct Pager {
     file: File,
-    pages: [Option<Box<Page>>; Pager::MAX_PAGES as usize],
+    pages: Vec<Option<Box<Page>>>,
     file_length: u64,
     page_count: PageNumber,
 }
@@ -389,9 +387,13 @@ impl Pager {
         let file_length = file.metadata()?.len();
         assert!(file_length % PAGE_SIZE as u64 == 0);
         let page_count = file_length / PAGE_SIZE as u64;
+        let mut pages = Vec::new();
+        for _ in 0..page_count {
+            pages.push(None);
+        }
         Ok(Pager {
             file,
-            pages: array![None; Pager::MAX_PAGES as usize],
+            pages,
             file_length,
             page_count: page_count as PageNumber,
         })
@@ -419,34 +421,32 @@ impl Pager {
         self.file.set_len(needed_file_length)?;
         self.file_length = needed_file_length;
         self.page_count += 1;
-        assert!(self.pages[page_num as usize].is_none());
-        let page = &mut self.pages[page_num as usize];
-        *page = Some(Box::new(p));
+        self.pages.push(Some(Box::new(p)));
         Ok((page_num, self.get_page(page_num)?.unwrap()))
     }
 
     fn get_page(&mut self, page_num: PageNumber) -> TableResult<Option<&mut Page>> {
-        assert!(page_num < Pager::MAX_PAGES);
+        if page_num >= Pager::MAX_PAGES {
+            return Ok(None);
+        }
 
-        let page = &mut self.pages[page_num as usize];
+        let page = self.pages.get_mut(page_num as usize);
 
         if let Some(page) = page {
-            Ok(Some(page))
-        } else {
-            // expand file as needed
-            let file_offset = (PAGE_SIZE as u64) * (page_num as u64);
-            let needed_file_length = file_offset + (PAGE_SIZE as u64);
-
-            if needed_file_length > self.file_length {
-                return Ok(None);
+            if let Some(page) = page {
+                Ok(Some(page))
+            } else {
+                let file_offset = (PAGE_SIZE as u64) * (page_num as u64);
+                let needed_file_length = file_offset + (PAGE_SIZE as u64);
+                assert!(needed_file_length <= self.file_length);
+                // read in an existing page
+                self.file.seek(SeekFrom::Start(file_offset))?;
+                let faulted_page = Page::deserialize(&mut self.file)?;
+                *page = Some(Box::new(faulted_page));
+                Ok(Some(page.as_mut().unwrap()))
             }
-
-            // read in an existing page
-            self.file.seek(SeekFrom::Start(file_offset))?;
-            let faulted_page = Page::deserialize(&mut self.file)?;
-
-            *page = Some(Box::new(faulted_page));
-            Ok(Some(page.as_mut().unwrap()))
+        } else {
+            Ok(None)
         }
     }
 
@@ -546,13 +546,6 @@ impl<'a> Cursor<'a> {
         Ok(match self.page()?.node {
             Node::Internal(_) => unreachable!(),
             Node::Leaf(ref leaf) => leaf,
-        })
-    }
-
-    fn internal_node_mut(&mut self) -> TableResult<&mut InternalNode> {
-        Ok(match self.page()?.node {
-            Node::Internal(ref mut i) => i,
-            Node::Leaf(_) => unreachable!(),
         })
     }
 
