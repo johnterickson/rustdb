@@ -1,13 +1,17 @@
 #[macro_use]
 extern crate static_assertions;
 
-use std::fmt::{Display, Formatter};
+use owning_ref::StableAddress;
+use owning_ref::{OwningRef,  OwningHandle, OwningRefMut};
+use std::fmt::{Display, Formatter, Debug};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::path::Path;
 use std::process;
-use std::str::{from_utf8, FromStr};
+use std::{str::{from_utf8, FromStr}, ops::{DerefMut, Deref}};
+use parking_lot::{RwLock,RwLockReadGuard,RwLockUpgradableReadGuard,RwLockWriteGuard};
+use parking_lot::{lock_api::RawRwLockUpgrade};
 
 type Id = u32;
 type PageNumber = u32;
@@ -21,6 +25,8 @@ enum TableError {
     IdAlreadyExists,
     CannotSplitInternalNodes,
     RootPageNotFound,
+    PageNotFound,
+    CellNotFound,
 }
 
 impl From<io::Error> for TableError {
@@ -97,6 +103,22 @@ impl Row {
 struct LeafCell {
     key: Id,
     row: Row,
+}
+
+impl Debug for LeafCell {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("{}", self))
+    }
+}
+
+impl Display for LeafCell {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!(
+            "{:0>8}:[{}]",
+            self.key,
+            self.row,
+        ))
+    }
 }
 
 const_assert!(size_of::<LeafCell>() == size_of::<Id>() + size_of::<Row>());
@@ -383,27 +405,89 @@ impl Page {
     }
 }
 
+// struct ReadGuard<'a,T> (RwLockReadGuard<'a,T>);
+// impl<'a, T> Deref for ReadGuard<'a, T> {
+//     type Target = T;
+//     fn deref(&self) -> &<Self as std::ops::Deref>::Target { &*self.0 }
+// }
+// unsafe impl<'a,T> StableDeref for ReadGuard<'a,T> {}
+
+// struct UpgradableReadGuard<'a,T> (RwLockUpgradableReadGuard<'a,T>);
+// impl<'a, T> Deref for UpgradableReadGuard<'a, T> {
+//     type Target = T;
+//     fn deref(&self) -> &<Self as std::ops::Deref>::Target { &*self.0 }
+// }
+// unsafe impl<'a,T> StableDeref for UpgradableReadGuard<'a,T> {}
+
+// struct WriteGuard<'a,T>(RwLockWriteGuard<'a,T>);
+// impl <'a,T> Deref for WriteGuard<'a,T> {
+//     type Target = T;
+//     fn deref(&self) -> &<Self as std::ops::Deref>::Target { &*self.0 }
+// }
+// impl <'a,T> DerefMut for WriteGuard<'a,T> {
+//     fn deref_mut(&mut self) -> &mut Self::Target { &mut *self.0  }
+// }
+// unsafe impl<'a,T> StableDeref for WriteGuard<'a,T> {}
+
+pub fn upgradable_read_lock_rwlock_in_owning_ref<'a,M,T>(m: M) -> OwningHandle<M, OwningRef<RwLockUpgradableReadGuard<'a,T>,T>>
+    where M: Deref<Target=RwLock<T>>, M: StableAddress
+{
+    OwningHandle::new_with_fn(m, unsafe { |m: *const RwLock<T>| {
+        let read_guard = m.as_ref().unwrap().upgradable_read();
+        OwningRef::new(read_guard)
+    }})
+}
+
+pub fn read_lock_rwlock_in_owning_ref<'a,M,T>(m: M) -> OwningHandle<M, OwningRef<RwLockReadGuard<'a,T>,T>>
+    where M: Deref<Target=RwLock<T>>, M: StableAddress
+{
+    OwningHandle::new_with_fn(m, unsafe { |m: *const RwLock<T>| {
+        let read_guard = m.as_ref().unwrap().read();
+        OwningRef::new(read_guard)
+    }})
+}
+
+pub fn write_lock_rwlock_in_owning_ref<'a,M,T>(m: M) -> OwningHandle<M, OwningRefMut<RwLockWriteGuard<'a,T>,T>>
+    where M: Deref<Target=RwLock<T>>, M: StableAddress
+{
+    OwningHandle::new_with_fn(m, unsafe {|m: *const RwLock<T>| {
+        let write_guard = m.as_ref().unwrap().write();
+        OwningRefMut::new(write_guard)
+    }})
+}
+type PageSlot = Option<Box<Page>>;
+type PageSlotLock = RwLock<PageSlot>;
+
+type TableReadGuard<'a> = RwLockReadGuard<'a,TableImpl>;
+type TableUpradableGuard<'a> = RwLockUpgradableReadGuard<'a,TableImpl>;
+
+// type PageSlotInnerWriteGuard<'a> = OwningRefMut<RwLockWriteGuard<'a,PageSlot>,PageSlot>;
+// type PageSlotWriteGuard<'a> = OwningHandle<PageListReadGuard<'a>, PageSlotInnerWriteGuard<'a>>;
+type PageReadGuard<'a> = OwningRef<RwLockReadGuard<'a, PageSlot>, Page>;
+type PageWriteGuard<'a> = OwningRefMut<RwLockWriteGuard<'a, PageSlot>, Page>;
+
+type LeafNodeReadGuard<'a> = OwningRef<PageReadGuard<'a>, LeafNode>;
+type LeafNodeWriteGuard<'a> = OwningRefMut<PageWriteGuard<'a>, LeafNode>;
+type CellWriteGuard<'a> = OwningRefMut<PageWriteGuard<'a>, LeafCell>;
+
 struct Pager {
-    file: File,
-    pages: Vec<Option<Box<Page>>>,
-    file_length: u64,
-    page_count: PageNumber,
+    file: RwLock<File>,
+    pages: Vec<PageSlotLock>,
 }
 
 impl Pager {
+
     fn from_file(file: File) -> TableResult<Pager> {
         let file_length = file.metadata()?.len();
         assert!(file_length % PAGE_SIZE as u64 == 0);
         let page_count = file_length / PAGE_SIZE as u64;
         let mut pages = Vec::new();
         for _ in 0..page_count {
-            pages.push(None);
+            pages.push(RwLock::new(None));
         }
         Ok(Pager {
-            file,
+            file: RwLock::new(file),
             pages,
-            file_length,
-            page_count: page_count as PageNumber,
         })
     }
 
@@ -416,51 +500,85 @@ impl Pager {
         Pager::from_file(file)
     }
 
-    fn alloc(&mut self, p: Page) -> TableResult<(PageNumber, &mut Page)> {
-        let page_num = self.page_count;
+    fn alloc(&mut self, p: Page) -> TableResult<PageNumber> {
+        let file = self.file.write();
+
+        let page_num = self.pages.len() as PageNumber;
+        let file_offset = (PAGE_SIZE as u64) * (page_num as u64);
+        let needed_file_length = file_offset + (PAGE_SIZE as u64);
+        file.set_len(needed_file_length)?;
+        self.pages.push(RwLock::new(Some(Box::new(p))));
+        Ok(page_num)
+    }
+
+    fn get_page_slot(&self, page_num: PageNumber) -> TableResult<RwLockReadGuard<'_,PageSlot>> {
+        if page_num >= self.pages.len() as PageNumber {
+            return Err(TableError::PageNotFound);
+        }
+        Ok(self.pages[page_num as usize].read())
+    }
+
+    fn get_page_slot_mut(&self, page_num: PageNumber) -> TableResult<RwLockWriteGuard<'_,PageSlot>> {
+        if page_num >= self.pages.len() as PageNumber {
+            return Err(TableError::PageNotFound);
+        }
+        Ok(self.pages[page_num as usize].write())
+
+    }
+    
+    fn get_page(&self, page_num: PageNumber) -> TableResult<PageReadGuard<'_>> {
+        loop 
+        {
+            let page_slot = self.get_page_slot(page_num)?;
+            // try with a read lock
+            if page_slot.is_some()
+            {
+                let page_slot = OwningRef::new(page_slot);
+                let page = page_slot.map(|page_slot| 
+                    page_slot.as_ref().unwrap().as_ref());
+                return Ok(page);
+            }
+
+            // try to fault in an existing page
+            let _ = self.get_page_mut(page_num)?;
+        }
+    }
+
+    fn get_page_mut(&self, page_num: PageNumber) -> TableResult<PageWriteGuard<'_>> {
+        let mut page_slot = self.get_page_slot_mut(page_num)?;
 
         let file_offset = (PAGE_SIZE as u64) * (page_num as u64);
-        assert!(file_offset == self.file_length);
-
-        let needed_file_length = file_offset + (PAGE_SIZE as u64);
-        self.file.set_len(needed_file_length)?;
-        self.file_length = needed_file_length;
-        self.page_count += 1;
-        self.pages.push(Some(Box::new(p)));
-        Ok((page_num, self.get_page(page_num)?.unwrap()))
-    }
-
-    fn get_page(&mut self, page_num: PageNumber) -> TableResult<Option<&mut Page>> {
-        let page_slot = self.pages.get_mut(page_num as usize);
-
-        if let Some(page_slot) = page_slot {
-            if let Some(page) = page_slot {
-                Ok(Some(page))
-            } else {
-                let file_offset = (PAGE_SIZE as u64) * (page_num as u64);
-                let needed_file_length = file_offset + (PAGE_SIZE as u64);
-                assert!(needed_file_length <= self.file_length);
-                // read in an existing page
-                self.file.seek(SeekFrom::Start(file_offset))?;
-                let faulted_page = Page::deserialize(&mut self.file)?;
-                *page_slot = Some(Box::new(faulted_page));
-                Ok(Some(page_slot.as_mut().unwrap()))
-            }
-        } else {
-            Ok(None)
+        if page_slot.is_none() {
+            let faulted_page = {
+                let mut file = self.file.write();
+                file.seek(SeekFrom::Start(file_offset))?;
+                Page::deserialize(&mut *file)?
+            };
+            *page_slot = Some(Box::new(faulted_page));
         }
+
+        let page_slot = OwningRefMut::new(page_slot);
+        let page = page_slot.map_mut(|page_slot| 
+            page_slot.as_mut().unwrap().as_mut());
+        Ok(page)
     }
 
-    fn flush_all(&mut self) -> TableResult<()> {
-        for page in self.pages.iter().enumerate() {
-            if let (page_num, Some(page)) = page {
+    fn page_count(&self) -> PageNumber {
+        self.pages.len() as PageNumber
+    }
+
+    fn flush_all(&self) -> TableResult<()> {
+        let mut file = self.file.write();
+        for (page_num, page) in self.pages.iter().enumerate() {
+            let page = page.read();
+            if let Some(page) = page.as_ref() {
                 let file_offset = (PAGE_SIZE as u64) * (page_num as u64);
-                self.file.seek(SeekFrom::Start(file_offset))?;
-                page.serialize(&mut self.file)?;
+                file.seek(SeekFrom::Start(file_offset))?;
+                page.serialize(&mut *file)?;
             }
         }
 
-        self.file.flush()?;
+        file.flush()?;
         Ok(())
     }
 }
@@ -471,25 +589,53 @@ impl Drop for Pager {
     }
 }
 
-struct Cursor<'a> {
-    table: &'a mut Table,
+trait ReadGuard<T> : Deref<Target = T> {}
+impl<'a,T> ReadGuard<T> for RwLockReadGuard<'a,T> {}
+impl<'a,T> ReadGuard<T> for RwLockUpgradableReadGuard<'a,T> {}
+impl<'a,T> ReadGuard<T> for RwLockWriteGuard<'a,T> {}
+
+trait WriteGuard<T> : ReadGuard<T> + DerefMut<Target = T> {}
+impl<'a,T> WriteGuard<T> for RwLockWriteGuard<'a,T> {}
+
+trait ReadUpgradeGuard<T> : ReadGuard<T> {
+    type Write: WriteGuard<T>;
+    fn upgrade_to_write(self) -> Self::Write;
+}
+
+impl<'a, T> ReadUpgradeGuard<T> for RwLockUpgradableReadGuard<'a, T> {
+    type Write = RwLockWriteGuard<'a,T>;
+    fn upgrade_to_write(self) -> Self::Write { 
+        RwLockUpgradableReadGuard::upgrade(self)
+    }
+}
+
+// trait TableReadUpgradeGuard<'a> : ReadUpgradeGuard<TableImpl, RwLockWriteGuard<'a, TableImpl>> {}
+type TableReadUpgradeGuard<'a> = RwLockUpgradableReadGuard<'a, TableImpl>;
+
+enum FindResult {
+    Recurse(PageNumber),
+    Done(bool,CellNumber)
+}
+
+struct Cursor<T> {
+    table: Option<T>,
     page_index: PageNumber,
-    cell_number: CellNumber,
+    //cell_number: CellNumber,
     end_of_table: bool,
 }
 
-impl<'a> Cursor<'a> {
-    fn start(table: &'a mut Table) -> TableResult<Cursor<'a>> {
-        let (_, cursor) = Cursor::find(table, 0)?;
+impl<T: ReadGuard<TableImpl>> Cursor<T> {
+    fn start(table: T) -> TableResult<Cursor<T>> {
+        let (_, cursor) = Cursor::<T>::find(table, 0)?;
         Ok(cursor)
     }
 
     fn find_from_page(
-        table: &'a mut Table,
+        table: T,
         page_num: PageNumber,
         key: Id,
-    ) -> TableResult<(bool, Cursor<'a>)> {
-        match table.pager.get_page(page_num)?.unwrap().node {
+    ) -> TableResult<(bool, Cursor<T>)> {
+        let recurse = match table.pager.get_page(page_num)?.node {
             Node::Internal(ref internal) => {
                 let (_, mut child_number) = internal.find(key);
                 if child_number as usize == internal.children.len() {
@@ -497,20 +643,23 @@ impl<'a> Cursor<'a> {
                 }
                 let child_cell = internal.children.get(child_number as usize).unwrap();
                 let child_page_num = child_cell.child;
-                Cursor::find_from_page(table, child_page_num, key)
+                Some(child_page_num)
             }
             Node::Leaf(ref leaf) => {
                 let (found, cell_number) = leaf.find(key);
                 let mut cursor = Cursor {
-                    table,
+                    table: Some(table),
                     page_index: page_num,
                     cell_number: cell_number,
                     end_of_table: false,
                 };
                 cursor.update_end_of_table()?;
-                Ok((found, cursor))
+                None
             }
         }
+
+        // Cursor::<T>::find_from_page(table, child_page_num, key)
+        //
     }
 
     /*
@@ -518,36 +667,74 @@ impl<'a> Cursor<'a> {
     If the key is not present, return the position
     where it should be inserted
     */
-    fn find(table: &'a mut Table, key: Id) -> TableResult<(bool, Cursor<'a>)> {
-        Cursor::find_from_page(table, table.root_page, key)
+    fn find(table: T, key: Id) -> TableResult<(bool, Cursor<T>)> {
+        Cursor::<T>::find_from_page(table, table.root_page, key)
+    }
+}
+
+impl<T> Cursor<T> where T: ReadGuard<TableImpl>
+{
+    fn page<'a>(&'a self) -> TableResult<PageReadGuard<'a>> {
+        Ok(self.table.unwrap().pager.get_page(self.page_index)?)
     }
 
-    fn page(&mut self) -> TableResult<&mut Page> {
-        Ok(self.table.pager.get_page(self.page_index)?.unwrap())
+    fn page_mut(&self) -> TableResult<PageWriteGuard<'_>> {
+        Ok(self.table.unwrap().pager.get_page_mut(self.page_index)?)
     }
 
-    fn cell(&mut self) -> TableResult<Option<&mut LeafCell>> {
+    fn cell(&mut self) -> TableResult<Option<CellWriteGuard>> {
         let cell_number = self.cell_number;
-        Ok(match self.page()?.node {
-            Node::Internal(_) => unimplemented!(),
-            Node::Leaf(ref mut leaf) => leaf.cells.get_mut(cell_number as usize),
-        })
+        let page = self.page_mut()?;
+        let page = OwningRefMut::new(page);
+        page.try_map_mut(|page| {
+            match page.node {
+                Node::Internal(_) => unimplemented!(),
+                Node::Leaf(ref mut leaf) => {
+                    match leaf.cells.get_mut(cell_number as usize) {
+                        None => return Err(TableError::CellNotFound),
+                        Some(cell) => {
+                            Ok(cell)
+                        }
+                    }
+                },
+            } 
+        })?;
+        unimplemented!();
     }
 
     fn update_end_of_table(&mut self) -> TableResult<()> {
         let cell_number = self.cell_number;
-        self.end_of_table = match self.page()?.node {
-            Node::Internal(_) => unreachable!(),
-            Node::Leaf(ref leaf) => cell_number as usize >= leaf.cells.len(),
+        self.end_of_table = {
+            let x = match self.page()?.node {
+                Node::Internal(_) => unreachable!(),
+                Node::Leaf(ref leaf) => cell_number as usize >= leaf.cells.len(),
+            };
+            x
         };
+
         Ok(())
     }
 
-    fn leaf_node(&mut self) -> TableResult<&LeafNode> {
-        Ok(match self.page()?.node {
-            Node::Internal(_) => unreachable!(),
-            Node::Leaf(ref leaf) => leaf,
-        })
+    fn leaf_node(&self) -> TableResult<LeafNodeReadGuard> {
+        let page = self.page()?;
+        let page = OwningRef::new(page);
+        Ok(page.map(|page| {
+            match page.node {
+                Node::Internal(_) => unreachable!(),
+                Node::Leaf(ref leaf) => leaf,
+            }
+        }))
+    }
+
+    fn leaf_node_mut(&self) -> TableResult<LeafNodeWriteGuard> {
+        let page = self.page_mut()?;
+        let page = OwningRefMut::new(page);
+        Ok(page.map_mut(|page| {
+            match page.node {
+                Node::Internal(_) => unreachable!(),
+                Node::Leaf(ref mut leaf) => leaf,
+            }
+        }))
     }
 
     fn advance(&mut self) -> TableResult<()> {
@@ -566,56 +753,53 @@ impl<'a> Cursor<'a> {
         self.page_index = next_leaf;
         Ok(())
     }
+}
 
-    fn insert(&mut self, cell: LeafCell) -> TableResult<()> {
+impl<T> Cursor<T> where T: ReadUpgradeGuard<TableImpl>
+{
+    fn insert(self, cell: LeafCell) -> TableResult<()> {
         let cell_number = self.cell_number as usize;
 
         // let's see if there's room in this node
         {
-            match self.page()?.node {
-                Node::Leaf(ref mut leaf) => {
-                    if leaf.cells.len() < LeafNode::MAX_CELLS {
-                        leaf.cells.insert(cell_number, cell);
-                        self.table.row_count += 1;
-                        self.table.validate()?;
-                        return Ok(());
-                    }
-                }
-                Node::Internal(_) => unimplemented!(),
-            };
+            let mut leaf = self.leaf_node_mut()?;
+            if leaf.cells.len() < LeafNode::MAX_CELLS {
+                leaf.cells.insert(cell_number, cell);
+                Table::validate(self.table.unwrap())?;
+                return Ok(());
+            }
         }
 
         // we'll need to allocate some pages - let's see if we have room...
         let original_parent = self.page()?.parent;
         if let Some(original_parent) = original_parent {
-            let parent_page = self.table.pager.get_page(original_parent)?.unwrap();
+            let parent_page = self.table.unwrap().pager.get_page_mut(original_parent)?;
             if parent_page.node.as_internal().children.len() == InternalNode::MAX_CELLS {
                 return Err(TableError::CannotSplitInternalNodes);
             }
         }
+
+
+        let read_guard = self.table.take().unwrap();
+        let table = read_guard.upgrade_to_write();
 
         // we'll need to split the node
         // first, move the top half of cells to a new "right" node
         let mut right = LeafNode::create_empty();
         let orig_leaf_max = self.page()?.node.max_key().unwrap();
         {
-            match self.page()?.node {
-                Node::Leaf(ref mut leaf) => {
-                    right.next_leaf = leaf.next_leaf;
-
-                    right.cells = leaf.cells.split_off(LeafNode::LEFT_SPLIT_COUNT);
-                    if cell_number < LeafNode::LEFT_SPLIT_COUNT {
-                        right.cells.insert(0, leaf.cells.pop().unwrap());
-                        leaf.cells.insert(cell_number, cell);
-                    } else {
-                        let cell_number = cell_number - LeafNode::LEFT_SPLIT_COUNT;
-                        right.cells.insert(cell_number, cell);
-                    }
-                    assert_eq!(leaf.cells.len(), LeafNode::LEFT_SPLIT_COUNT);
-                    assert_eq!(right.cells.len(), LeafNode::RIGHT_SPLIT_COUNT);
-                }
-                Node::Internal(_) => unimplemented!(),
+            let mut leaf = self.leaf_node_mut()?;
+            right.next_leaf = leaf.next_leaf;
+            right.cells = leaf.cells.split_off(LeafNode::LEFT_SPLIT_COUNT);
+            if cell_number < LeafNode::LEFT_SPLIT_COUNT {
+                right.cells.insert(0, leaf.cells.pop().unwrap());
+                leaf.cells.insert(cell_number, cell);
+            } else {
+                let cell_number = cell_number - LeafNode::LEFT_SPLIT_COUNT;
+                right.cells.insert(cell_number, cell);
             }
+            assert_eq!(leaf.cells.len(), LeafNode::LEFT_SPLIT_COUNT);
+            assert_eq!(right.cells.len(), LeafNode::RIGHT_SPLIT_COUNT);
         }
 
         // next, we want to create a new parent that will point to this node and to new right node
@@ -625,14 +809,14 @@ impl<'a> Cursor<'a> {
         let right_max = right.max_key().unwrap();
 
         let left_page_num = self.page_index;
-        let (right_page_num, _) = self.table.pager.alloc(Page {
+        let right_page_num = table.pager.alloc(Page {
             node: right,
             parent: None,
         })?;
 
         let parent_page_num = match original_parent {
             Some(parent) => {
-                match self.table.pager.get_page(parent)?.as_mut().unwrap().node {
+                match table.pager.get_page_mut(parent)?.node {
                     Node::Leaf(_) => unreachable!(),
                     Node::Internal(ref mut i) => {
                         if let Ok(left_child) = i
@@ -677,8 +861,8 @@ impl<'a> Cursor<'a> {
                     node: Node::Internal(new_internal_node),
                     parent: original_parent,
                 };
-                let (parent_page_num, _) = self.table.pager.alloc(new_page)?;
-                let left = self.table.pager.get_page(left_page_num)?.unwrap();
+                let parent_page_num = table.pager.alloc(new_page)?;
+                let mut left = table.pager.get_page_mut(left_page_num)?;
                 left.parent = Some(parent_page_num);
 
                 parent_page_num
@@ -686,23 +870,22 @@ impl<'a> Cursor<'a> {
         };
 
         // update pointer
-        let left = self.table.pager.get_page(left_page_num)?.unwrap();
+        let mut left = table.pager.get_page_mut(left_page_num)?;
         if let Node::Leaf(ref mut left) = left.node {
             left.next_leaf = right_page_num;
         } else {
             assert!(false);
         }
 
-        self.table.pager.get_page(right_page_num)?.unwrap().parent = Some(parent_page_num);
+        table.pager.get_page_mut(right_page_num)?.parent = Some(parent_page_num);
 
         // update next leaf pointer
 
-        if self.table.root_page == left_page_num {
-            self.table.root_page = parent_page_num;
+        if table.root_page == left_page_num {
+            table.root_page = parent_page_num;
         }
-
-        self.table.row_count += 1;
-        self.table.validate()?;
+        
+        Table::validate(table)?;
         Ok(())
     }
 }
@@ -732,52 +915,59 @@ impl Statement {
     }
 }
 
-struct Table {
+struct TableImpl {
     root_page: PageNumber,
     pager: Pager,
-    row_count: Id,
 }
+
+struct Table (RwLock<TableImpl>);
 
 impl Table {
     fn new(mut pager: Pager) -> TableResult<Table> {
-        let mut root_page = None;
 
-        let mut page_num = 0;
-        while let Some(page) = pager.get_page(page_num)? {
-            if page.parent.is_none() {
-                root_page = Some(page_num);
-                break;
-            }
-            page_num += 1;
-        }
-
-        let root_page = match root_page {
-            Some(p) => p,
-            None => {
-                if page_num > 0 {
-                    return Err(TableError::RootPageNotFound);
-                } else {
-                    let (new_root, _) = pager.alloc(Page::create_leaf(None))?;
-                    new_root
+        let page_count = pager.page_count();
+        let root_page = if page_count == 0 {
+            pager.alloc(Page::create_leaf(None))?
+        } else {
+            let mut root_page = None;
+            for page_num in 0..page_count {
+                let page = pager.get_page(page_num)?;
+                if page.parent.is_none() {
+                    root_page = Some(page_num);
+                    break;
                 }
             }
+            if root_page.is_none() {
+                return Err(TableError::RootPageNotFound);
+            } else {
+                root_page.unwrap()
+            }
         };
 
-        let mut table = Table {
+        let table = TableImpl {
             root_page,
             pager,
-            row_count: 0,
         };
-        let mut row_count = 0;
-        let mut cursor = Cursor::start(&mut table)?;
-        while !cursor.end_of_table {
-            cursor.advance()?;
-            row_count += 1;
+     
+        Ok(Table (RwLock::new(table)))
+    }
+
+    fn print_tree<'a,W: Write>(table: &'a TableReadGuard<'a>, output: &mut W, page_num: PageNumber, indent: usize) -> TableResult<()> {
+        for _ in 0..indent { write!(output, " ")?; }
+        let page = table.pager.get_page(page_num)?;
+        write!(output, "page: {} parent: {:?}", page_num, page.parent)?;
+        match page.node {
+            Node::Internal(ref internal) => {
+                for child in &internal.children {
+                    Table::print_tree(table, output, child.child, indent+1);
+                }
+            }
+            Node::Leaf(ref leaf) => {
+                writeln!(output, " {:?}", leaf.cells)?;
+            }
         }
 
-        table.row_count = row_count;
-
-        Ok(table)
+        Ok(())
     }
 
     fn exec<W: Write>(&mut self, s: &Statement, output: &mut W) -> TableResult<()> {
@@ -795,7 +985,8 @@ impl Table {
                 let email = email.as_bytes();
                 row.email[..email.len()].copy_from_slice(email);
 
-                let (found, mut cursor) = Cursor::find(self, *id)?;
+                let read_guard = self.0.upgradable_read();
+                let (found, mut cursor) = Cursor::find(read_guard, *id)?;
                 if found {
                     Err(TableError::IdAlreadyExists)
                 } else {
@@ -804,7 +995,8 @@ impl Table {
             }
             Statement::Select => {
                 let mut row_count = 0;
-                let mut cursor = Cursor::start(self)?;
+                let read_guard = self.0.upgradable_read();
+                let mut cursor = Cursor::<TableReadUpgradeGuard<'_>>::start(read_guard)?;
                 while !cursor.end_of_table {
                     writeln!(output, " {}", cursor.cell()?.as_ref().unwrap().row)?;
                     cursor.advance()?;
@@ -816,12 +1008,11 @@ impl Table {
         }
     }
 
-    fn validate(&mut self) -> TableResult<()> {
-        let mut cursor = Cursor::start(self)?;
-        let mut rows_found = 0;
+    fn validate<T: ReadGuard<TableImpl>>(table: T) -> TableResult<()> 
+    {
+        let mut cursor = Cursor::start(table)?;
         let mut last_key = None;
         while !cursor.end_of_table {
-            rows_found += 1;
 
             let this_key = cursor.cell()?.as_ref().unwrap().key;
             assert!(last_key.is_none() || last_key.unwrap() < this_key);
@@ -851,7 +1042,6 @@ impl Table {
             cursor.advance()?;
         }
 
-        assert_eq!(self.row_count, rows_found);
         Ok(())
     }
 }

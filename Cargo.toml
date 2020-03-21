@@ -10,3 +10,8 @@ edition = "2018"
 static_assertions = "*"
 tempfile = "3"
 rand = "0.7"
+owning_ref = "*"
+
+[dependencies.parking_lot]
+version ="*"
+features = ["owning_ref"]
