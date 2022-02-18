@@ -1,17 +1,18 @@
 #[macro_use]
 extern crate static_assertions;
 
-use owning_ref::StableAddress;
-use owning_ref::{OwningRef,  OwningHandle, OwningRefMut};
-use std::fmt::{Display, Formatter, Debug};
+use owning_ref::{OwningRef, OwningRefMut};
+use parking_lot::{RwLock, RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard};
+use std::fmt::{Debug, Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::path::Path;
 use std::process;
-use std::{str::{from_utf8, FromStr}, ops::{DerefMut, Deref}};
-use parking_lot::{RwLock,RwLockReadGuard,RwLockUpgradableReadGuard,RwLockWriteGuard};
-use parking_lot::{lock_api::RawRwLockUpgrade};
+use std::{
+    ops::{Deref, DerefMut},
+    str::{from_utf8, FromStr},
+};
 
 type Id = u32;
 type PageNumber = u32;
@@ -113,11 +114,7 @@ impl Debug for LeafCell {
 
 impl Display for LeafCell {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!(
-            "{:0>8}:[{}]",
-            self.key,
-            self.row,
-        ))
+        f.write_fmt(format_args!("{:0>8}:[{}]", self.key, self.row,))
     }
 }
 
@@ -345,9 +342,9 @@ impl Node {
         }
     }
 
-    fn as_leaf(&self) -> &LeafNode {
+    fn as_leaf_mut(&mut self) -> &mut LeafNode {
         match self {
-            Node::Leaf(ref leaf) => leaf,
+            Node::Leaf(ref mut leaf) => leaf,
             _ => panic!("Not a leaf node."),
         }
     }
@@ -408,12 +405,12 @@ impl Page {
 type PageSlot = Option<Box<Page>>;
 type PageSlotLock = RwLock<PageSlot>;
 
-type PageReadGuard<'a> = OwningRef<RwLockReadGuard<'a,PageSlot>, Page>;
-type PageWriteGuard<'a> = OwningRefMut<RwLockWriteGuard<'a,PageSlot>, Page>;
+type PageReadGuard<'a> = OwningRef<RwLockReadGuard<'a, PageSlot>, Page>;
+type PageWriteGuard<'a> = OwningRefMut<RwLockWriteGuard<'a, PageSlot>, Page>;
 
-type LeafNodeReadGuard<'a> = OwningRef<RwLockReadGuard<'a,PageSlot>, LeafNode>;
-type LeafNodeWriteGuard<'a> = OwningRefMut<RwLockWriteGuard<'a,PageSlot>, LeafNode>;
-type CellWriteGuard<'a> = OwningRefMut<RwLockWriteGuard<'a,PageSlot>, LeafCell>;
+type LeafNodeReadGuard<'a> = OwningRef<RwLockReadGuard<'a, PageSlot>, LeafNode>;
+type LeafNodeWriteGuard<'a> = OwningRefMut<RwLockWriteGuard<'a, PageSlot>, LeafNode>;
+type CellWriteGuard<'a> = OwningRefMut<RwLockWriteGuard<'a, PageSlot>, LeafCell>;
 
 struct Pager {
     file: RwLock<File>,
@@ -421,7 +418,6 @@ struct Pager {
 }
 
 impl Pager {
-
     fn from_file(file: File) -> TableResult<Pager> {
         let file_length = file.metadata()?.len();
         assert!(file_length % PAGE_SIZE as u64 == 0);
@@ -455,7 +451,7 @@ impl Pager {
         Ok(page_num)
     }
 
-    fn get_page_slot(&self, page_num: PageNumber) -> TableResult<RwLockReadGuard<'_,PageSlot>> {
+    fn get_page_slot(&self, page_num: PageNumber) -> TableResult<RwLockReadGuard<'_, PageSlot>> {
         if page_num >= self.pages.len() as PageNumber {
             return Err(TableError::PageNotFound);
         }
@@ -463,29 +459,29 @@ impl Pager {
         Ok(page_slot)
     }
 
-    fn get_page_slot_mut(&self, page_num: PageNumber) -> TableResult<RwLockWriteGuard<'_,PageSlot>> {
+    fn get_page_slot_mut(
+        &self,
+        page_num: PageNumber,
+    ) -> TableResult<RwLockWriteGuard<'_, PageSlot>> {
         if page_num >= self.pages.len() as PageNumber {
             return Err(TableError::PageNotFound);
         }
         let page_slot = self.pages[page_num as usize].write();
         Ok(page_slot)
-
     }
-    
+
     fn get_page(&self, page_num: PageNumber) -> TableResult<PageReadGuard> {
-        loop 
-        {
-            let page_slot = self.get_page_slot(page_num)?;
-            // try with a read lock
-            if page_slot.is_some()
+        loop {
             {
-                let page_slot = OwningRef::new(page_slot);
-                let page = page_slot.map(|page_slot| 
-                    page_slot.as_ref().unwrap().as_ref());
-                return Ok(page);
+                let page_slot = self.get_page_slot(page_num)?;
+                // try with a read lock
+                if page_slot.is_some() {
+                    let page_slot = OwningRef::new(page_slot);
+                    let page = page_slot.map(|page_slot| page_slot.as_ref().unwrap().as_ref());
+                    return Ok(page);
+                }
             }
 
-            drop(page_slot);
             // try to fault in an existing page
             let _ = self.get_page_mut(page_num)?;
         }
@@ -505,8 +501,7 @@ impl Pager {
         }
 
         let page_slot = OwningRefMut::new(page_slot);
-        let page = page_slot.map_mut(|page_slot| 
-            page_slot.as_mut().unwrap().as_mut());
+        let page = page_slot.map_mut(|page_slot| page_slot.as_mut().unwrap().as_mut());
         Ok(page)
     }
 
@@ -535,32 +530,31 @@ impl Drop for Pager {
     }
 }
 
-trait ReadGuard<T> : Deref<Target = T> {}
-impl<'a,T> ReadGuard<T> for RwLockReadGuard<'a,T> {}
-impl<'a,T> ReadGuard<T> for RwLockUpgradableReadGuard<'a,T> {}
-impl<'a,T> ReadGuard<T> for RwLockWriteGuard<'a,T> {}
+trait ReadGuard<T>: Deref<Target = T> {}
+impl<'a, T> ReadGuard<T> for RwLockReadGuard<'a, T> {}
+impl<'a, T> ReadGuard<T> for RwLockUpgradableReadGuard<'a, T> {}
+impl<'a, T> ReadGuard<T> for RwLockWriteGuard<'a, T> {}
 
-trait WriteGuard<T> : ReadGuard<T> + DerefMut<Target = T> {}
-impl<'a,T> WriteGuard<T> for RwLockWriteGuard<'a,T> {}
+trait WriteGuard<T>: ReadGuard<T> + DerefMut<Target = T> {}
+impl<'a, T> WriteGuard<T> for RwLockWriteGuard<'a, T> {}
 
-trait ReadUpgradeGuard<T> : ReadGuard<T> {
+trait ReadUpgradeGuard<T>: ReadGuard<T> {
     type Write: WriteGuard<T>;
     fn upgrade_to_write(self) -> Self::Write;
 }
 
 impl<'a, T> ReadUpgradeGuard<T> for RwLockUpgradableReadGuard<'a, T> {
-    type Write = RwLockWriteGuard<'a,T>;
-    fn upgrade_to_write(self) -> Self::Write { 
+    type Write = RwLockWriteGuard<'a, T>;
+    fn upgrade_to_write(self) -> Self::Write {
         RwLockUpgradableReadGuard::upgrade(self)
     }
 }
 
-// trait TableReadUpgradeGuard<'a> : ReadUpgradeGuard<TableImpl, RwLockWriteGuard<'a, TableImpl>> {}
 type TableReadUpgradeGuard<'a> = RwLockUpgradableReadGuard<'a, TableImpl>;
 
 enum FindResult {
     Recurse(PageNumber),
-    Done((bool,CellNumber))
+    Done((bool, CellNumber)),
 }
 
 struct Cursor<T> {
@@ -576,11 +570,7 @@ impl<T: ReadGuard<TableImpl>> Cursor<T> {
         Ok(cursor)
     }
 
-    fn find_from_page(
-        table: T,
-        page_num: PageNumber,
-        key: Id,
-    ) -> TableResult<(bool, Cursor<T>)> {
+    fn find_from_page(table: T, page_num: PageNumber, key: Id) -> TableResult<(bool, Cursor<T>)> {
         let recurse = match table.pager.get_page(page_num)?.node {
             Node::Internal(ref internal) => {
                 let (_, mut child_number) = internal.find(key);
@@ -590,17 +580,19 @@ impl<T: ReadGuard<TableImpl>> Cursor<T> {
                 let child_cell = internal.children.get(child_number as usize).unwrap();
                 let child_page_num = child_cell.child;
                 FindResult::Recurse(child_page_num)
-            },
+            }
             Node::Leaf(ref leaf) => FindResult::Done(leaf.find(key)),
         };
 
         Ok(match recurse {
-            FindResult::Recurse(child_page_num) => Cursor::find_from_page(table, child_page_num, key)?,
+            FindResult::Recurse(child_page_num) => {
+                Cursor::find_from_page(table, child_page_num, key)?
+            }
             FindResult::Done((found, cell_number)) => {
                 let mut cursor = Cursor {
                     table: Some(table),
                     page_index: page_num,
-                    cell_number: cell_number,
+                    cell_number,
                     end_of_table: false,
                 };
                 cursor.update_end_of_table()?;
@@ -620,31 +612,31 @@ impl<T: ReadGuard<TableImpl>> Cursor<T> {
     }
 }
 
-impl<T> Cursor<T> where T: ReadGuard<TableImpl>
+impl<T> Cursor<T>
+where
+    T: ReadGuard<TableImpl>,
 {
     fn page(&self) -> TableResult<PageReadGuard> {
         self.table.as_ref().unwrap().pager.get_page(self.page_index)
     }
 
     fn page_mut(&self) -> TableResult<PageWriteGuard> {
-        self.table.as_ref().unwrap().pager.get_page_mut(self.page_index)
+        self.table
+            .as_ref()
+            .unwrap()
+            .pager
+            .get_page_mut(self.page_index)
     }
 
     fn cell(&self) -> TableResult<CellWriteGuard> {
         let cell_number = self.cell_number;
         let page = self.page_mut()?;
-        page.try_map_mut(|page| {
-            match page.node {
-                Node::Internal(_) => unimplemented!(),
-                Node::Leaf(ref mut leaf) => {
-                    match leaf.cells.get_mut(cell_number as usize) {
-                        None => return Err(TableError::CellNotFound),
-                        Some(cell) => {
-                            return Ok(cell)
-                        }
-                    }
-                },
-            } 
+        page.try_map_mut(|page| match page.node {
+            Node::Internal(_) => unimplemented!(),
+            Node::Leaf(ref mut leaf) => match leaf.cells.get_mut(cell_number as usize) {
+                None => Err(TableError::CellNotFound),
+                Some(cell) => Ok(cell),
+            },
         })
     }
 
@@ -663,20 +655,17 @@ impl<T> Cursor<T> where T: ReadGuard<TableImpl>
 
     fn leaf_node(&self) -> TableResult<LeafNodeReadGuard> {
         let page = self.page()?;
-        Ok(page.map(|page| {
-            match page.node {
-                Node::Internal(_) => unreachable!(),
-                Node::Leaf(ref leaf) => leaf,
-            }
+        Ok(page.map(|page| match page.node {
+            Node::Internal(_) => unreachable!(),
+            Node::Leaf(ref leaf) => leaf,
         }))
     }
 
     fn leaf_node_mut(&self) -> TableResult<LeafNodeWriteGuard> {
         let page = self.page_mut()?;
-        Ok(page.map_mut(|page| { match page.node {
-                Node::Internal(_) => unreachable!(),
-                Node::Leaf(ref mut leaf) => leaf,
-            }
+        Ok(page.map_mut(|page| match page.node {
+            Node::Internal(_) => unreachable!(),
+            Node::Leaf(ref mut leaf) => leaf,
         }))
     }
 
@@ -728,19 +717,21 @@ impl<T> Cursor<T> where T: ReadUpgradeGuard<TableImpl>
             table: None,
             page_index: self.page_index,
             cell_number: self.cell_number,
-            end_of_table: self.end_of_table
+            end_of_table: self.end_of_table,
         };
 
         let read_guard = self.table.take().unwrap();
         let write_guard = read_guard.upgrade_to_write();
 
         cursor.table = Some(write_guard);
-        
+
         cursor.insert_write(cell)
     }
 }
 
-impl<T> Cursor<T> where T: WriteGuard<TableImpl>
+impl<T> Cursor<T>
+where
+    T: WriteGuard<TableImpl>,
 {
     fn insert_write(mut self, cell: LeafCell) -> TableResult<()> {
         let cell_number = self.cell_number as usize;
@@ -801,7 +792,14 @@ impl<T> Cursor<T> where T: WriteGuard<TableImpl>
 
         let parent_page_num = match original_parent {
             Some(parent) => {
-                match self.table.as_ref().unwrap().pager.get_page_mut(parent)?.node {
+                match self
+                    .table
+                    .as_ref()
+                    .unwrap()
+                    .pager
+                    .get_page_mut(parent)?
+                    .node
+                {
                     Node::Leaf(_) => unreachable!(),
                     Node::Internal(ref mut i) => {
                         if let Ok(left_child) = i
@@ -857,11 +855,18 @@ impl<T> Cursor<T> where T: WriteGuard<TableImpl>
 
         // update pointer
         {
-            let mut left = self.table.as_ref().unwrap().pager.get_page_mut(left_page_num)?;
+            let mut left = self
+                .table
+                .as_ref()
+                .unwrap()
+                .pager
+                .get_page_mut(left_page_num)?;
+            left.node.as_leaf_mut().next_leaf = right_page_num;
+
             if let Node::Leaf(ref mut left) = left.node {
                 left.next_leaf = right_page_num;
             } else {
-                assert!(false);
+                panic!("Expected");
             }
         }
 
@@ -875,7 +880,7 @@ impl<T> Cursor<T> where T: WriteGuard<TableImpl>
                 table.root_page = parent_page_num;
             }
         }
-        
+
         Table::validate(self.table.unwrap())?;
         Ok(())
     }
@@ -884,6 +889,7 @@ impl<T> Cursor<T> where T: WriteGuard<TableImpl>
 enum Statement {
     Insert(Id, String, String),
     Select,
+    Print,
 }
 
 impl Statement {
@@ -898,6 +904,7 @@ impl Statement {
                 Some(Statement::Insert(id, username, email))
             }
             "select" => Some(Statement::Select),
+            "print" => Some(Statement::Print),
             command => {
                 eprintln!("Unknown command: {}", &command);
                 None
@@ -911,11 +918,10 @@ struct TableImpl {
     pager: Pager,
 }
 
-struct Table (RwLock<TableImpl>);
+struct Table(RwLock<TableImpl>);
 
 impl Table {
     fn new(mut pager: Pager) -> TableResult<Table> {
-
         let page_count = pager.page_count();
         let root_page = if page_count == 0 {
             pager.alloc(Page::create_leaf(None))?
@@ -928,33 +934,38 @@ impl Table {
                     break;
                 }
             }
-            if root_page.is_none() {
-                return Err(TableError::RootPageNotFound);
+            if let Some(root_page) = root_page {
+                root_page
             } else {
-                root_page.unwrap()
+                return Err(TableError::RootPageNotFound);
             }
         };
 
-        let table = TableImpl {
-            root_page,
-            pager,
-        };
-     
-        Ok(Table (RwLock::new(table)))
+        let table = TableImpl { root_page, pager };
+
+        Ok(Table(RwLock::new(table)))
     }
 
-    fn print_tree<W: Write, T: ReadGuard<TableImpl>>(table: &T, output: &mut W, page_num: PageNumber, indent: usize) -> TableResult<()> {
-        for _ in 0..indent { write!(output, " ")?; }
+    fn print_tree<W: Write, T: ReadGuard<TableImpl>>(
+        table: &T,
+        output: &mut W,
+        page_num: PageNumber,
+        indent: usize,
+    ) -> TableResult<()> {
+        for _ in 0..indent {
+            write!(output, " ")?;
+        }
         let page = table.pager.get_page(page_num)?;
         write!(output, "page: {} parent: {:?}", page_num, page.parent)?;
         match page.node {
             Node::Internal(ref internal) => {
+                writeln!(output, " internal")?;
                 for child in &internal.children {
-                    Table::print_tree(table, output, child.child, indent+1);
+                    Table::print_tree(table, output, child.child, indent + 1)?;
                 }
             }
             Node::Leaf(ref leaf) => {
-                writeln!(output, " {:?}", leaf.cells)?;
+                writeln!(output, " leaf {:?}", leaf.cells)?;
             }
         }
 
@@ -996,15 +1007,18 @@ impl Table {
                 writeln!(output, "{} rows.", row_count)?;
                 Ok(())
             }
+            Statement::Print => {
+                let read_guard = self.0.read();
+                Table::print_tree(&read_guard, output, read_guard.root_page, 0)?;
+                Ok(())
+            }
         }
     }
 
-    fn validate<T: ReadGuard<TableImpl>>(table: T) -> TableResult<()> 
-    {
+    fn validate<T: ReadGuard<TableImpl>>(table: T) -> TableResult<()> {
         let mut cursor = Cursor::start(table)?;
         let mut last_key = None;
         while !cursor.end_of_table {
-
             let this_key = cursor.cell()?.key;
             assert!(last_key.is_none() || last_key.unwrap() < this_key);
             last_key = Some(this_key);
@@ -1059,49 +1073,54 @@ impl<R: BufRead, W: Write> Repl<R, W> {
             let mut line = String::new();
             match self.input.read_line(&mut line) {
                 Ok(_) => {
+                    let line = line.trim();
                     writeln!(&mut self.output)?;
 
-                    if let Some(c) = line.chars().next() {
-                        if c == '.' {
-                            let mut tokens = line.split_whitespace();
-                            match tokens.next().unwrap() {
-                                ".constants" => {
-                                    writeln!(
-                                        &mut self.output,
-                                        "LeafNode::LEFT_SPLIT_COUNT: {}",
-                                        &LeafNode::LEFT_SPLIT_COUNT
-                                    )?;
-                                    writeln!(
-                                        &mut self.output,
-                                        "LeafNode::RIGHT_SPLIT_COUNT: {}",
-                                        &LeafNode::RIGHT_SPLIT_COUNT
-                                    )?;
-                                    writeln!(
-                                        &mut self.output,
-                                        "LeafNode::MAX_CELLS: {}",
-                                        &LeafNode::MAX_CELLS
-                                    )?;
-                                    writeln!(
-                                        &mut self.output,
-                                        "InternalNode::MAX_CELLS: {}",
-                                        &InternalNode::MAX_CELLS
-                                    )?;
-                                }
-                                ".exit" => return Ok(0),
-                                _ => {
-                                    write!(&mut self.output, "Unknown command: {}", &line)?;
-                                }
+                    let c = if let Some(c) = line.chars().next() { 
+                        c
+                    } else {
+                        continue;
+                    };
+
+                    if c == '.' {
+                        let mut tokens = line.split_whitespace();
+                        match tokens.next().unwrap() {
+                            ".constants" => {
+                                writeln!(
+                                    &mut self.output,
+                                    "LeafNode::LEFT_SPLIT_COUNT: {}",
+                                    &LeafNode::LEFT_SPLIT_COUNT
+                                )?;
+                                writeln!(
+                                    &mut self.output,
+                                    "LeafNode::RIGHT_SPLIT_COUNT: {}",
+                                    &LeafNode::RIGHT_SPLIT_COUNT
+                                )?;
+                                writeln!(
+                                    &mut self.output,
+                                    "LeafNode::MAX_CELLS: {}",
+                                    &LeafNode::MAX_CELLS
+                                )?;
+                                writeln!(
+                                    &mut self.output,
+                                    "InternalNode::MAX_CELLS: {}",
+                                    &InternalNode::MAX_CELLS
+                                )?;
                             }
-                        } else {
-                            if let Some(stmt) = Statement::parse(&line) {
-                                if let Err(e) = self.table.exec(&stmt, &mut self.output) {
-                                    writeln!(&mut self.output, "Error: {:?}", &e)?;
-                                    if bail_on_fail {
-                                        return Err(e);
-                                    }
-                                }
+                            ".exit" => return Ok(0),
+                            _ => {
+                                write!(&mut self.output, "Unknown command: {}", &line)?;
                             }
                         }
+                    } else if let Some(stmt) = Statement::parse(&line) {
+                        if let Err(e) = self.table.exec(&stmt, &mut self.output) {
+                            writeln!(&mut self.output, "Error: {:?}", &e)?;
+                            if bail_on_fail {
+                                return Err(e);
+                            }
+                        }
+                    } else {
+                        panic!("Unknown command: `{}`", line);
                     }
                 }
                 Err(e) => {
