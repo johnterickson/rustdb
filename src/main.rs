@@ -1112,7 +1112,7 @@ impl<R: BufRead, W: Write> Repl<R, W> {
                                 write!(&mut self.output, "Unknown command: {}", &line)?;
                             }
                         }
-                    } else if let Some(stmt) = Statement::parse(&line) {
+                    } else if let Some(stmt) = Statement::parse(line) {
                         if let Err(e) = self.table.exec(&stmt, &mut self.output) {
                             writeln!(&mut self.output, "Error: {:?}", &e)?;
                             if bail_on_fail {
