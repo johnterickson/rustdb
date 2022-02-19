@@ -1,8 +1,14 @@
-use std::{io::{Write, Read}, mem::size_of};
+use std::{
+    io::{Read, Write},
+    mem::size_of,
+};
 
 use crate::*;
 
-pub trait Serialize where Self: Sized {
+pub trait Serialize
+where
+    Self: Sized,
+{
     fn serialize<W: Write>(&self, writer: W) -> TableResult<()>;
     fn deserialize<R: Read>(reader: R) -> TableResult<Self>;
 }

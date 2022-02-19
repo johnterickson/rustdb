@@ -144,7 +144,7 @@ impl InternalNode {
     pub const WASTED_SPACE: usize = Self::SPACE_FOR_CELLS - (Self::MAX_CELLS * InternalCell::SIZE);
     pub const RIGHT_SPLIT_COUNT: usize = (Self::MAX_CELLS + 1) / 2;
     pub const LEFT_SPLIT_COUNT: usize = Self::MAX_CELLS + 1 - Self::RIGHT_SPLIT_COUNT;
-    
+
     fn create_empty() -> Self {
         InternalNode {
             children: Vec::with_capacity(Self::MAX_CELLS),
@@ -240,7 +240,10 @@ struct Cursor<T: Deref<Target = TableImpl>> {
     end_of_table: bool,
 }
 
-impl<T> Cursor<T> where T: Deref<Target = TableImpl> {
+impl<T> Cursor<T>
+where
+    T: Deref<Target = TableImpl>,
+{
     fn start(table: T) -> TableResult<Cursor<T>> {
         let (_, cursor) = Cursor::<T>::find(table, 0)?;
         Ok(cursor)
@@ -358,7 +361,10 @@ impl<T> Cursor<T> where T: Deref<Target = TableImpl> {
     }
 }
 
-impl<T> Cursor<T> where T: ReadUpgradeGuard<TableImpl> {
+impl<T> Cursor<T>
+where
+    T: ReadUpgradeGuard<TableImpl>,
+{
     fn insert(mut self, cell: LeafCell) -> TableResult<()> {
         let cell_number = self.cell_number as usize;
 
@@ -399,8 +405,7 @@ impl<T> Cursor<T> where T: ReadUpgradeGuard<TableImpl> {
     }
 }
 
-impl<T: DerefMut<Target=TableImpl>> Cursor<T>
-{
+impl<T: DerefMut<Target = TableImpl>> Cursor<T> {
     fn insert_write(mut self, cell: LeafCell) -> TableResult<()> {
         let cell_number = self.cell_number as usize;
 
@@ -683,7 +688,7 @@ impl Table {
         }
     }
 
-    fn validate<T: Deref<Target=TableImpl>>(table: T) -> TableResult<()> {
+    fn validate<T: Deref<Target = TableImpl>>(table: T) -> TableResult<()> {
         let mut cursor = Cursor::start(table)?;
         let mut last_key = None;
         while !cursor.end_of_table {
@@ -744,7 +749,7 @@ impl<R: BufRead, W: Write> Repl<R, W> {
                     let line = line.trim();
                     writeln!(&mut self.output)?;
 
-                    let c = if let Some(c) = line.chars().next() { 
+                    let c = if let Some(c) = line.chars().next() {
                         c
                     } else {
                         continue;
