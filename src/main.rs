@@ -1,6 +1,15 @@
 #[macro_use]
 extern crate static_assertions;
 
+mod locks;
+use locks::*;
+
+mod pager;
+use pager::*;
+
+mod serialize;
+use serialize::*;
+
 use owning_ref::{OwningRef, OwningRefMut};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockUpgradableReadGuard, RwLockWriteGuard};
 use std::fmt::{Debug, Display, Formatter};
@@ -21,7 +30,7 @@ type CellNumber = u32;
 const PAGE_SIZE: usize = 4096;
 
 #[derive(Debug)]
-enum TableError {
+pub enum TableError {
     Io(io::Error),
     IdAlreadyExists,
     CannotSplitInternalNodes,
@@ -36,7 +45,7 @@ impl From<io::Error> for TableError {
     }
 }
 
-type TableResult<T> = Result<T, TableError>;
+pub type TableResult<T> = Result<T, TableError>;
 
 #[repr(C)]
 struct Row {
@@ -76,32 +85,11 @@ impl Row {
     const USERNAME_SIZE: usize = 32;
     const EMAIL_SIZE: usize = 256;
     const SIZE: usize = size_of::<Row>();
-
-    fn deserialize<R: Read>(r: &mut R) -> std::io::Result<Row> {
-        let mut id = [0u8; size_of::<Id>()];
-        r.read_exact(&mut id)?;
-        let id = Id::from_le_bytes(id);
-        let mut row = Row {
-            id,
-            username: [0u8; Row::USERNAME_SIZE],
-            email: [0u8; Row::EMAIL_SIZE],
-        };
-        r.read_exact(&mut row.username)?;
-        r.read_exact(&mut row.email)?;
-        Ok(row)
-    }
-
-    fn serialize<W: Write>(&self, w: &mut W) -> std::io::Result<()> {
-        w.write_all(&self.id.to_le_bytes())?;
-        w.write_all(&self.username)?;
-        w.write_all(&self.email)?;
-        Ok(())
-    }
 }
 
 #[repr(C)]
 #[derive(Default)]
-struct LeafCell {
+pub struct LeafCell {
     key: Id,
     row: Row,
 }
@@ -126,21 +114,6 @@ impl LeafCell {
     const VALUE_SIZE: usize = Row::SIZE;
     const VALUE_OFFSET: usize = LeafCell::KEY_OFFSET + LeafCell::KEY_SIZE;
     const SIZE: usize = LeafCell::VALUE_OFFSET + LeafCell::VALUE_SIZE;
-
-    fn deserialize<R: Read>(r: &mut R) -> std::io::Result<LeafCell> {
-        let mut id = [0u8; size_of::<Id>()];
-        r.read_exact(&mut id)?;
-        let row = Row::deserialize(r)?;
-        Ok(LeafCell {
-            key: Id::from_le_bytes(id),
-            row,
-        })
-    }
-
-    fn serialize<W: Write>(&self, w: &mut W) -> std::io::Result<()> {
-        w.write_all(&self.key.to_le_bytes())?;
-        self.row.serialize(w)
-    }
 }
 
 #[derive(Debug, Default)]
@@ -155,41 +128,26 @@ impl InternalCell {
     const CHILD_SIZE: usize = size_of::<PageNumber>();
     const CHILD_OFFSET: usize = InternalCell::KEY_OFFSET + InternalCell::KEY_SIZE;
     const SIZE: usize = InternalCell::CHILD_OFFSET + InternalCell::CHILD_SIZE;
-
-    fn deserialize<R: Read>(r: &mut R) -> std::io::Result<InternalCell> {
-        let mut id = [0u8; size_of::<Id>()];
-        r.read_exact(&mut id)?;
-        let mut page_num = [0u8; size_of::<PageNumber>()];
-        r.read_exact(&mut page_num)?;
-        Ok(InternalCell {
-            key: Id::from_le_bytes(id),
-            child: PageNumber::from_le_bytes(page_num),
-        })
-    }
-
-    fn serialize<W: Write>(&self, w: &mut W) -> std::io::Result<()> {
-        w.write_all(&self.key.to_le_bytes())?;
-        w.write_all(&self.child.to_le_bytes())
-    }
 }
 
 const_assert!(size_of::<InternalCell>() == size_of::<Id>() + size_of::<PageNumber>());
 
-struct InternalNode {
+pub struct InternalNode {
     children: Vec<InternalCell>,
     right_child: Option<PageNumber>,
 }
 
 impl InternalNode {
-    const HEADER_SIZE: usize = size_of::<u32>() + size_of::<PageNumber>();
-    const SPACE_FOR_CELLS: usize = PAGE_SIZE - Page::HEADER_SIZE - InternalNode::HEADER_SIZE;
-    const MAX_CELLS: usize = InternalNode::SPACE_FOR_CELLS / InternalCell::SIZE;
-    const WASTED_SPACE: usize =
-        InternalNode::SPACE_FOR_CELLS - (InternalNode::MAX_CELLS * InternalCell::SIZE);
-
-    fn create_empty() -> InternalNode {
+    pub const HEADER_SIZE: usize = size_of::<u32>() + size_of::<PageNumber>();
+    pub const SPACE_FOR_CELLS: usize = PAGE_SIZE - Page::HEADER_SIZE - Self::HEADER_SIZE;
+    pub const MAX_CELLS: usize = Self::SPACE_FOR_CELLS / InternalCell::SIZE;
+    pub const WASTED_SPACE: usize = Self::SPACE_FOR_CELLS - (Self::MAX_CELLS * InternalCell::SIZE);
+    pub const RIGHT_SPLIT_COUNT: usize = (Self::MAX_CELLS + 1) / 2;
+    pub const LEFT_SPLIT_COUNT: usize = Self::MAX_CELLS + 1 - Self::RIGHT_SPLIT_COUNT;
+    
+    fn create_empty() -> Self {
         InternalNode {
-            children: Vec::with_capacity(InternalNode::MAX_CELLS),
+            children: Vec::with_capacity(Self::MAX_CELLS),
             right_child: None,
         }
     }
@@ -202,61 +160,24 @@ impl InternalNode {
             Err(insert_here) => (false, insert_here as CellNumber),
         }
     }
-
-    fn serialize<W: Write>(&self, mut writer: W) -> TableResult<()> {
-        let mut child_count = [0u8; size_of::<u32>()];
-        child_count[0..4].copy_from_slice(&(self.children.len() as u32).to_le_bytes());
-        writer.write_all(&child_count)?;
-
-        for child in self.children.iter() {
-            child.serialize(&mut writer)?;
-        }
-
-        for _ in self.children.len()..InternalNode::MAX_CELLS {
-            InternalCell::default().serialize(&mut writer)?
-        }
-
-        writer.write_all(&[0u8; InternalNode::WASTED_SPACE])?;
-        Ok(())
-    }
-
-    fn deserialize<R: Read>(mut reader: R) -> TableResult<InternalNode> {
-        let mut child_count = [0u8; size_of::<u32>()];
-        reader.read_exact(&mut child_count[..])?;
-        let child_count = u32::from_le_bytes(child_count);
-
-        let mut node = InternalNode::create_empty();
-        for _ in 0..child_count {
-            node.children.push(InternalCell::deserialize(&mut reader)?);
-        }
-
-        for _ in child_count as usize..InternalNode::MAX_CELLS {
-            InternalCell::deserialize(&mut reader)?;
-        }
-
-        let mut padding = [0u8; InternalNode::WASTED_SPACE];
-        reader.read_exact(&mut padding)?;
-
-        Ok(node)
-    }
 }
 
-struct LeafNode {
+pub struct LeafNode {
     cells: Vec<LeafCell>,
     next_leaf: PageNumber,
 }
 
 impl LeafNode {
     const HEADER_SIZE: usize = size_of::<u32>() + size_of::<PageNumber>();
-    const SPACE_FOR_CELLS: usize = PAGE_SIZE - Page::HEADER_SIZE - LeafNode::HEADER_SIZE;
-    const MAX_CELLS: usize = LeafNode::SPACE_FOR_CELLS / LeafCell::SIZE;
-    const WASTED_SPACE: usize = LeafNode::SPACE_FOR_CELLS - (LeafNode::MAX_CELLS * LeafCell::SIZE);
-    const RIGHT_SPLIT_COUNT: usize = (LeafNode::MAX_CELLS + 1) / 2;
-    const LEFT_SPLIT_COUNT: usize = LeafNode::MAX_CELLS + 1 - LeafNode::RIGHT_SPLIT_COUNT;
+    const SPACE_FOR_CELLS: usize = PAGE_SIZE - Page::HEADER_SIZE - Self::HEADER_SIZE;
+    const MAX_CELLS: usize = Self::SPACE_FOR_CELLS / LeafCell::SIZE;
+    const WASTED_SPACE: usize = Self::SPACE_FOR_CELLS - (Self::MAX_CELLS * LeafCell::SIZE);
+    const RIGHT_SPLIT_COUNT: usize = (Self::MAX_CELLS + 1) / 2;
+    const LEFT_SPLIT_COUNT: usize = Self::MAX_CELLS + 1 - Self::RIGHT_SPLIT_COUNT;
 
-    fn create_empty() -> LeafNode {
+    fn create_empty() -> Self {
         LeafNode {
-            cells: Vec::with_capacity(LeafNode::MAX_CELLS),
+            cells: Vec::with_capacity(Self::MAX_CELLS),
             next_leaf: 0,
         }
     }
@@ -268,54 +189,9 @@ impl LeafNode {
             Err(insert_here) => (false, insert_here as CellNumber),
         }
     }
-
-    fn serialize<W: Write>(&self, mut writer: W) -> TableResult<()> {
-        let mut cell_count = [0u8; size_of::<u32>()];
-        cell_count[0..4].copy_from_slice(&(self.cells.len() as u32).to_le_bytes());
-        writer.write_all(&cell_count)?;
-
-        let mut next_leaf = [0u8; size_of::<u32>()];
-        next_leaf[0..4].copy_from_slice(&self.next_leaf.to_le_bytes());
-        writer.write_all(&next_leaf)?;
-
-        for cell in &self.cells {
-            cell.serialize(&mut writer)?;
-        }
-
-        for _ in self.cells.len()..LeafNode::MAX_CELLS {
-            LeafCell::default().serialize(&mut writer)?
-        }
-
-        writer.write_all(&[0u8; LeafNode::WASTED_SPACE])?;
-        Ok(())
-    }
-
-    fn deserialize<R: Read>(mut reader: R) -> TableResult<LeafNode> {
-        let mut cell_count = [0u8; size_of::<u32>()];
-        reader.read_exact(&mut cell_count[..])?;
-        let cell_count = u32::from_le_bytes(cell_count);
-
-        let mut next_leaf = [0u8; size_of::<u32>()];
-        reader.read_exact(&mut next_leaf[..])?;
-        let next_leaf = u32::from_le_bytes(next_leaf);
-
-        let mut node = LeafNode::create_empty();
-        for _ in 0..cell_count {
-            node.cells.push(LeafCell::deserialize(&mut reader)?);
-        }
-        for _ in cell_count as usize..LeafNode::MAX_CELLS {
-            LeafCell::deserialize(&mut reader)?;
-        }
-        node.next_leaf = next_leaf;
-
-        let mut padding = [0u8; LeafNode::WASTED_SPACE];
-        reader.read_exact(&mut padding)?;
-
-        Ok(node)
-    }
 }
 
-enum Node {
+pub enum Node {
     Internal(InternalNode),
     Leaf(LeafNode),
 }
@@ -350,206 +226,6 @@ impl Node {
     }
 }
 
-struct Page {
-    node: Node,
-    parent: Option<PageNumber>,
-}
-
-impl Page {
-    const HEADER_SIZE: usize = 6;
-
-    fn create_leaf(parent: Option<PageNumber>) -> Page {
-        Page {
-            node: Node::Leaf(LeafNode::create_empty()),
-            parent,
-        }
-    }
-
-    fn serialize<W: Write>(&self, mut writer: W) -> TableResult<()> {
-        let mut buf = [0u8; Page::HEADER_SIZE];
-        buf[0] = match self.node {
-            Node::Internal(_) => 0,
-            Node::Leaf(_) => 1,
-        };
-        buf[1] = match self.parent {
-            Some(_) => 0,
-            None => 1,
-        };
-        buf[2..].copy_from_slice(&self.parent.unwrap_or(0).to_le_bytes());
-        writer.write_all(&buf)?;
-        self.node.serialize(&mut writer)
-    }
-
-    fn deserialize<R: Read>(mut reader: R) -> TableResult<Page> {
-        let mut buf = [0u8; Page::HEADER_SIZE];
-        reader.read_exact(&mut buf[..])?;
-        let is_root = buf[1] == 1;
-        let parent = if is_root {
-            None
-        } else {
-            let mut parent = [0u8; size_of::<PageNumber>()];
-            parent.copy_from_slice(&buf[2..=5]);
-            Some(PageNumber::from_le_bytes(parent))
-        };
-
-        let node = match buf[0] {
-            0 => Node::Internal(InternalNode::deserialize(reader)?),
-            1 => Node::Leaf(LeafNode::deserialize(reader)?),
-            node_type => panic!("unknown node type {}", node_type),
-        };
-
-        Ok(Page { node, parent })
-    }
-}
-
-type PageSlot = Option<Box<Page>>;
-type PageSlotLock = RwLock<PageSlot>;
-
-type PageReadGuard<'a> = OwningRef<RwLockReadGuard<'a, PageSlot>, Page>;
-type PageWriteGuard<'a> = OwningRefMut<RwLockWriteGuard<'a, PageSlot>, Page>;
-
-type LeafNodeReadGuard<'a> = OwningRef<RwLockReadGuard<'a, PageSlot>, LeafNode>;
-type LeafNodeWriteGuard<'a> = OwningRefMut<RwLockWriteGuard<'a, PageSlot>, LeafNode>;
-type CellWriteGuard<'a> = OwningRefMut<RwLockWriteGuard<'a, PageSlot>, LeafCell>;
-
-struct Pager {
-    file: RwLock<File>,
-    pages: Vec<PageSlotLock>,
-}
-
-impl Pager {
-    fn from_file(file: File) -> TableResult<Pager> {
-        let file_length = file.metadata()?.len();
-        assert!(file_length % PAGE_SIZE as u64 == 0);
-        let page_count = file_length / PAGE_SIZE as u64;
-        let mut pages = Vec::new();
-        for _ in 0..page_count {
-            pages.push(RwLock::new(None));
-        }
-        Ok(Pager {
-            file: RwLock::new(file),
-            pages,
-        })
-    }
-
-    fn open<P: AsRef<Path>>(path: P) -> TableResult<Pager> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .open(path)?;
-        Pager::from_file(file)
-    }
-
-    fn alloc(&mut self, p: Page) -> TableResult<PageNumber> {
-        let page_num = self.pages.len() as PageNumber;
-        let file_offset = (PAGE_SIZE as u64) * (page_num as u64);
-        let needed_file_length = file_offset + (PAGE_SIZE as u64);
-        let file = self.file.write();
-        file.set_len(needed_file_length)?;
-        self.pages.push(RwLock::new(Some(Box::new(p))));
-        Ok(page_num)
-    }
-
-    fn get_page_slot(&self, page_num: PageNumber) -> TableResult<RwLockReadGuard<'_, PageSlot>> {
-        if page_num >= self.pages.len() as PageNumber {
-            return Err(TableError::PageNotFound);
-        }
-        let page_slot = self.pages[page_num as usize].read();
-        Ok(page_slot)
-    }
-
-    fn get_page_slot_mut(
-        &self,
-        page_num: PageNumber,
-    ) -> TableResult<RwLockWriteGuard<'_, PageSlot>> {
-        if page_num >= self.pages.len() as PageNumber {
-            return Err(TableError::PageNotFound);
-        }
-        let page_slot = self.pages[page_num as usize].write();
-        Ok(page_slot)
-    }
-
-    fn get_page(&self, page_num: PageNumber) -> TableResult<PageReadGuard> {
-        loop {
-            {
-                let page_slot = self.get_page_slot(page_num)?;
-                // try with a read lock
-                if page_slot.is_some() {
-                    let page_slot = OwningRef::new(page_slot);
-                    let page = page_slot.map(|page_slot| page_slot.as_ref().unwrap().as_ref());
-                    return Ok(page);
-                }
-            }
-
-            // try to fault in an existing page
-            let _ = self.get_page_mut(page_num)?;
-        }
-    }
-
-    fn get_page_mut(&self, page_num: PageNumber) -> TableResult<PageWriteGuard> {
-        let mut page_slot = self.get_page_slot_mut(page_num)?;
-
-        let file_offset = (PAGE_SIZE as u64) * (page_num as u64);
-        if page_slot.is_none() {
-            let faulted_page = {
-                let mut file = self.file.write();
-                file.seek(SeekFrom::Start(file_offset))?;
-                Page::deserialize(&mut *file)?
-            };
-            *page_slot = Some(Box::new(faulted_page));
-        }
-
-        let page_slot = OwningRefMut::new(page_slot);
-        let page = page_slot.map_mut(|page_slot| page_slot.as_mut().unwrap().as_mut());
-        Ok(page)
-    }
-
-    fn page_count(&self) -> PageNumber {
-        self.pages.len() as PageNumber
-    }
-
-    fn flush_all(&mut self) -> TableResult<()> {
-        for (page_num, page) in self.pages.iter().enumerate() {
-            if let Some(page) = page.read().as_ref() {
-                let file_offset = (PAGE_SIZE as u64) * (page_num as u64);
-                let mut file = self.file.write();
-                file.seek(SeekFrom::Start(file_offset))?;
-                page.serialize(&mut *file)?;
-            }
-        }
-
-        self.file.write().flush()?;
-        Ok(())
-    }
-}
-
-impl Drop for Pager {
-    fn drop(&mut self) {
-        self.flush_all().unwrap();
-    }
-}
-
-trait ReadGuard<T>: Deref<Target = T> {}
-impl<'a, T> ReadGuard<T> for RwLockReadGuard<'a, T> {}
-impl<'a, T> ReadGuard<T> for RwLockUpgradableReadGuard<'a, T> {}
-impl<'a, T> ReadGuard<T> for RwLockWriteGuard<'a, T> {}
-
-trait WriteGuard<T>: ReadGuard<T> + DerefMut<Target = T> {}
-impl<'a, T> WriteGuard<T> for RwLockWriteGuard<'a, T> {}
-
-trait ReadUpgradeGuard<T>: ReadGuard<T> {
-    type Write: WriteGuard<T>;
-    fn upgrade_to_write(self) -> Self::Write;
-}
-
-impl<'a, T> ReadUpgradeGuard<T> for RwLockUpgradableReadGuard<'a, T> {
-    type Write = RwLockWriteGuard<'a, T>;
-    fn upgrade_to_write(self) -> Self::Write {
-        RwLockUpgradableReadGuard::upgrade(self)
-    }
-}
-
 type TableReadUpgradeGuard<'a> = RwLockUpgradableReadGuard<'a, TableImpl>;
 
 enum FindResult {
@@ -557,14 +233,14 @@ enum FindResult {
     Done((bool, CellNumber)),
 }
 
-struct Cursor<T> {
+struct Cursor<T: Deref<Target = TableImpl>> {
     table: Option<T>,
     page_index: PageNumber,
     cell_number: CellNumber,
     end_of_table: bool,
 }
 
-impl<T: ReadGuard<TableImpl>> Cursor<T> {
+impl<T> Cursor<T> where T: Deref<Target = TableImpl> {
     fn start(table: T) -> TableResult<Cursor<T>> {
         let (_, cursor) = Cursor::<T>::find(table, 0)?;
         Ok(cursor)
@@ -610,12 +286,7 @@ impl<T: ReadGuard<TableImpl>> Cursor<T> {
         let page_num = table.root_page;
         Cursor::<T>::find_from_page(table, page_num, key)
     }
-}
 
-impl<T> Cursor<T>
-where
-    T: ReadGuard<TableImpl>,
-{
     fn page(&self) -> TableResult<PageReadGuard> {
         self.table.as_ref().unwrap().pager.get_page(self.page_index)
     }
@@ -687,8 +358,7 @@ where
     }
 }
 
-impl<T> Cursor<T> where T: ReadUpgradeGuard<TableImpl>
-{
+impl<T> Cursor<T> where T: ReadUpgradeGuard<TableImpl> {
     fn insert(mut self, cell: LeafCell) -> TableResult<()> {
         let cell_number = self.cell_number as usize;
 
@@ -729,9 +399,7 @@ impl<T> Cursor<T> where T: ReadUpgradeGuard<TableImpl>
     }
 }
 
-impl<T> Cursor<T>
-where
-    T: WriteGuard<TableImpl>,
+impl<T: DerefMut<Target=TableImpl>> Cursor<T>
 {
     fn insert_write(mut self, cell: LeafCell) -> TableResult<()> {
         let cell_number = self.cell_number as usize;
@@ -1015,7 +683,7 @@ impl Table {
         }
     }
 
-    fn validate<T: ReadGuard<TableImpl>>(table: T) -> TableResult<()> {
+    fn validate<T: Deref<Target=TableImpl>>(table: T) -> TableResult<()> {
         let mut cursor = Cursor::start(table)?;
         let mut last_key = None;
         while !cursor.end_of_table {
